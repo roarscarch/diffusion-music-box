@@ -38,49 +38,51 @@ class SpectrogramAugmenter:
 
     def random_scale(self, tile, scale_range=(0.9, 1.1)):
         """Scale the tile by a random factor."""
-        factor = self.rng.uniform(*scale_range)
-        return tile * factor
+        scale = self.rng.uniform(*scale_range)
+        return tile * scale
 
-    def random_noise(self, tile, noise_level=0.01):
-        """Add a small amount of Gaussian noise to the tile."""
+    def random_brightness(self, tile, delta_range=(-0.05, 0.05)):
+        """Add a random constant offset to the tile."""
+        delta = self.rng.uniform(*delta_range)
+        return tile + delta
+
+    def random_noise(self, tile, noise_level=0.02):
+        """Add small Gaussian noise to the tile."""
         noise = self.rng.normal(0, noise_level, tile.shape)
         return tile + noise
 
-    def random_mix(self, tile1, tile2, mix_range=(0.0, 0.2)):
-        """Mix a small amount of another tile into this one."""
-        alpha = self.rng.uniform(*mix_range)
-        return (1 - alpha) * tile1 + alpha * tile2
+    def random_freq_mask(self, tile, max_masks=2, mask_width=4):
+        """Randomly zero out a few frequency bands."""
+        n_masks = self.rng.integers(0, max_masks + 1)
+        for _ in range(n_masks):
+            start = self.rng.integers(0, tile.shape[-2] - mask_width)
+            tile[..., start:start+mask_width, :] = 0.0
+        return tile
 
-    def apply_random(self, tile, transforms=None):
-        """Apply a random subset of augmentations.
+    def random_time_mask(self, tile, max_masks=2, mask_width=4):
+        """Randomly zero out a few time steps."""
+        n_masks = self.rng.integers(0, max_masks + 1)
+        for _ in range(n_masks):
+            start = self.rng.integers(0, tile.shape[-1] - mask_width)
+            tile[..., :, start:start+mask_width] = 0.0
+        return tile
 
-        Parameters
-        ----------
-        tile : np.ndarray
-            Input spectrogram tile of shape (n_freq, n_frames).
-        transforms : list of str, optional
-            List of augmentation names to consider. If None, all are used.
-
-        Returns
-        -------
-        np.ndarray
-            Augmented tile.
-        """
-        if transforms is None:
-            transforms = ['time_shift', 'freq_shift', 'scale', 'noise']
-
-        # Shuffle and apply a random subset (at least one)
-        n = self.rng.integers(1, len(transforms) + 1)
-        chosen = self.rng.choice(transforms, size=n, replace=False)
-
-        result = np.array(tile, dtype=float)
-        for name in chosen:
-            if name == 'time_shift':
-                result = self.random_time_shift(result)
-            elif name == 'freq_shift':
-                result = self.random_freq_shift(result)
-            elif name == 'scale':
-                result = self.random_scale(result)
-            elif name == 'noise':
-                result = self.random_noise(result)
+    def apply_all(self, tile):
+        """Apply a random combination of augmentations."""
+        # Randomly select a subset of augmentation functions
+        funcs = [
+            self.random_time_shift,
+            self.random_freq_shift,
+            self.random_scale,
+            self.random_brightness,
+            self.random_noise,
+            self.random_freq_mask,
+            self.random_time_mask,
+        ]
+        # Shuffle and apply a random number (0 to all)
+        self.rng.shuffle(funcs)
+        n_apply = self.rng.integers(0, len(funcs) + 1)
+        result = tile.copy()
+        for fn in funcs[:n_apply]:
+            result = fn(result)
         return result
