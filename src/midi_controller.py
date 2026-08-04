@@ -1,125 +1,109 @@
 import numpy as np
 import threading
 import time
-from collections import deque
 
 
-class MIDIKeyboardController:
-    """Headless MIDI-like control via keyboard for interactive parameter adjustment.
+class MIDIController:
+    """Keyboard-based control for interactive parameters.
 
-    The controller listens for keyboard input in a background thread and maps
-    key presses to parameter changes. It maintains a thread-safe parameter
-    dictionary that can be read by the main application loop.
+    This controller listens for keyboard input in a background thread and
+    maps keys to parameter adjustments. It is designed to be used in a
+    headless CLI environment, providing a MIDI-like experience without
+    requiring actual MIDI hardware.
 
-    Supported keys:
-        - 'n' / 'N' : increase / decrease diffusion steps
-        - 's' / 'S' : increase / decrease noise scale (0.0 to 1.0)
-        - 't' / 'T' : increase / decrease tempo (BPM)
-        - ' ' (space) : toggle pause / resume generation
-        - 'q' : quit
+    Parameters
+    ----------
+    param_holder : object
+        An object with attributes that can be adjusted (e.g., noise_schedule,
+        diffusion_steps, tempo). The controller will modify these in place.
     """
 
-    def __init__(self, initial_params=None):
-        self._params = {
-            'diffusion_steps': 50,
-            'noise_scale': 0.6,
-            'tempo': 120.0,
-            'paused': False,
-            'quit': False,
-        }
-        if initial_params:
-            self._params.update(initial_params)
-        self._lock = threading.Lock()
-        self._key_queue = deque()
-        self._listener_thread = None
+    def __init__(self, param_holder):
+        self.param_holder = param_holder
         self._running = False
+        self._thread = None
+        self._keymap = {
+            'q': ('tempo', -5.0),
+            'w': ('tempo', 5.0),
+            'a': ('diffusion_steps', -1),
+            's': ('diffusion_steps', 1),
+            'z': ('noise_schedule', 'prev'),
+            'x': ('noise_schedule', 'next'),
+        }
+        self._schedule_cycle = ['linear', 'cosine', 'quadratic']
 
     def start(self):
-        """Start the keyboard listener in a background thread."""
+        """Start the input listener thread."""
         if self._running:
             return
         self._running = True
-        self._listener_thread = threading.Thread(target=self._listen, daemon=True)
-        self._listener_thread.start()
+        self._thread = threading.Thread(target=self._listen, daemon=True)
+        self._thread.start()
 
     def stop(self):
-        """Stop the keyboard listener."""
+        """Stop the input listener thread."""
         self._running = False
-        if self._listener_thread:
-            self._listener_thread.join(timeout=1.0)
-            self._listener_thread = None
+        if self._thread:
+            self._thread.join(timeout=1.0)
+            self._thread = None
 
     def _listen(self):
-        """Background thread that reads keyboard input."""
-        import sys
-        import termios
-        import tty
-
-        old_settings = termios.tcgetattr(sys.stdin)
+        """Background loop reading keyboard input."""
         try:
-            tty.setcbreak(sys.stdin.fileno())
+            import tty
+            import termios
+            import sys
+
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                while self._running:
+                    ch = sys.stdin.read(1)
+                    if not ch:
+                        continue
+                    if ch == '\x1b':  # ESC
+                        break
+                    self._handle_key(ch.lower())
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except ImportError:
+            # Fallback for non-POSIX systems: read lines
             while self._running:
-                ch = sys.stdin.read(1)
-                if ch:
-                    with self._lock:
-                        self._key_queue.append(ch)
-        except Exception:
-            pass
-        finally:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-
-    def poll_events(self):
-        """Process any pending key events and update parameters.
-
-        Returns a list of strings describing the changes made.
-        """
-        changes = []
-        with self._lock:
-            while self._key_queue:
-                key = self._key_queue.popleft()
-                change = self._handle_key(key)
-                if change:
-                    changes.append(change)
-        return changes
+                try:
+                    line = input()
+                    if not line:
+                        continue
+                    self._handle_key(line.strip().lower())
+                except EOFError:
+                    break
+                except KeyboardInterrupt:
+                    break
 
     def _handle_key(self, key):
-        """Handle a single key press and update parameters.
+        """Apply the key mapping to adjust parameters."""
+        if key not in self._keymap:
+            return
+        param, delta = self._keymap[key]
+        if param == 'noise_schedule':
+            self._cycle_schedule(delta)
+        else:
+            current = getattr(self.param_holder, param, None)
+            if current is not None:
+                setattr(self.param_holder, param, current + delta)
+                print(f"{param} = {getattr(self.param_holder, param)}")
 
-        Returns a description string if a parameter changed, else None.
-        """
-        if key == 'n':
-            self._params['diffusion_steps'] = min(200, self._params['diffusion_steps'] + 10)
-            return f"diffusion_steps -> {self._params['diffusion_steps']}"
-        elif key == 'N':
-            self._params['diffusion_steps'] = max(1, self._params['diffusion_steps'] - 10)
-            return f"diffusion_steps -> {self._params['diffusion_steps']}"
-        elif key == 's':
-            self._params['noise_scale'] = min(1.0, self._params['noise_scale'] + 0.05)
-            return f"noise_scale -> {self._params['noise_scale']:.2f}"
-        elif key == 'S':
-            self._params['noise_scale'] = max(0.0, self._params['noise_scale'] - 0.05)
-            return f"noise_scale -> {self._params['noise_scale']:.2f}"
-        elif key == 't':
-            self._params['tempo'] = min(240.0, self._params['tempo'] + 5.0)
-            return f"tempo -> {self._params['tempo']:.1f}"
-        elif key == 'T':
-            self._params['tempo'] = max(40.0, self._params['tempo'] - 5.0)
-            return f"tempo -> {self._params['tempo']:.1f}"
-        elif key == ' ':
-            self._params['paused'] = not self._params['paused']
-            state = "paused" if self._params['paused'] else "resumed"
-            return f"{state}"
-        elif key == 'q':
-            self._params['quit'] = True
-            return "quit requested"
-        return None
-
-    def get_params(self):
-        """Return a copy of the current parameters."""
-        with self._lock:
-            return dict(self._params)
-
-    def set_param(self, name, value):
-        """Set a parameter by name."""
-        with self._lock:
-            self._params[name] = value
+    def _cycle_schedule(self, direction):
+        """Cycle through noise schedules."""
+        current = getattr(self.param_holder, 'noise_schedule', 'linear')
+        try:
+            idx = self._schedule_cycle.index(current)
+        except ValueError:
+            idx = 0
+        if direction == 'next':
+            idx = (idx + 1) % len(self._schedule_cycle)
+        else:
+            idx = (idx - 1) % len(self._schedule_cycle)
+        new_schedule = self._schedule_cycle[idx]
+        setattr(self.param_holder, 'noise_schedule', new_schedule)
+        print(f"noise_schedule = {new_schedule}")
