@@ -1,147 +1,123 @@
-#!/usr/bin/env python3
-"""Main entry point for the Diffusion Music Box.
-
-Runs the full pipeline: generate spectrogram tiles with the diffusion denoiser,
-convert them to audio via the spectrogram inverter, and play them back with the
-audio engine. Keyboard controls adjust parameters in real-time.
-"""
-
 import argparse
+import logging
 import sys
 import time
+
 import numpy as np
 
-from src.audio_engine import AudioEngine
-from src.denoiser import Denoiser
-from src.midi_controller import MIDIKeyboardController
-from src.spectrogram import SpectrogramInverter
+from .audio_engine import AudioEngine
+from .augmentation import SpectrogramAugmenter
+from .config import Config
+from .denoiser import Denoiser
+from .scheduler import Scheduler
+from .spectrogram import Spectrogram
+from .spectrum_inverse import SpectrumInverse
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Generate endless ambient music from noise using a tiny diffusion model."
-    )
-    parser.add_argument(
-        "--sample-rate",
-        type=int,
-        default=22050,
-        help="Audio sample rate (default: 22050)",
-    )
-    parser.add_argument(
-        "--n-freq",
-        type=int,
-        default=257,
-        help="Number of frequency bins in the spectrogram (default: 257)",
-    )
-    parser.add_argument(
-        "--n-frames",
-        type=int,
-        default=128,
-        help="Number of time frames per spectrogram tile (default: 128)",
-    )
-    parser.add_argument(
-        "--diffusion-steps",
-        type=int,
-        default=50,
-        help="Number of diffusion steps per tile (default: 50)",
-    )
-    parser.add_argument(
-        "--noise-scale",
-        type=float,
-        default=0.6,
-        help="Noise scale for diffusion (default: 0.6)",
-    )
-    parser.add_argument(
-        "--tempo",
-        type=float,
-        default=120.0,
-        help="Tempo in BPM for tile generation rate (default: 120.0)",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="Output device name or index (default: None)",
-    )
+    parser = argparse.ArgumentParser(description="Diffusion Music Box - AI-generated ambient music")
+    parser.add_argument("-c", "--config", type=str, help="Path to config JSON file")
+    parser.add_argument("-d", "--device", type=str, help="Audio output device name or index")
+    parser.add_argument("-s", "--steps", type=int, help="Number of diffusion steps")
+    parser.add_argument("-t", "--tempo", type=float, help="Tempo in BPM")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
     return parser.parse_args()
-
-
-def generate_tile(denoiser, steps, noise_scale, rng):
-    """Generate a single spectrogram tile via denoising.
-
-    Starts from pure noise and iteratively denoises it.
-    """
-    shape = (denoiser.n_freq, denoiser.n_frames)
-    # Start with pure noise
-    x = rng.normal(0, 1.0, shape).astype(np.float32)
-    for i in range(steps):
-        # In a real diffusion model, we'd schedule noise removal.
-        # Here we simply apply the denoiser to the current tile.
-        # This is a placeholder: the denoiser's forward method returns
-        # the denoised image.
-        # We'll implement a simple reverse diffusion approximation.
-        # For now, just add a bit of noise each step and denoise.
-        noise = rng.normal(0, noise_scale, shape).astype(np.float32)
-        x = x + noise
-        x = denoiser.denoise(x)  # assuming denoiser has a denoise method
-    return x
 
 
 def main():
     args = parse_args()
 
-    # Initialize components
-    denoiser = Denoiser(n_freq=args.n_freq, n_frames=args.n_frames)
-    inverter = SpectrogramInverter(
-        sample_rate=args.sample_rate, n_freq=args.n_freq, n_frames=args.n_frames
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-    audio_engine = AudioEngine(
-        sample_rate=args.sample_rate, device=args.device
-    )
-    controller = MIDIKeyboardController(
-        initial_params={
-            "diffusion_steps": args.diffusion_steps,
-            "noise_scale": args.noise_scale,
-            "tempo": args.tempo,
-        }
-    )
-
-    rng = np.random.default_rng(0)
-
-    print("Diffusion Music Box started.")
-    print("Controls: n/N steps, s/S noise, t/T tempo, space pause, q quit")
-
-    # Start playback
-    audio_engine.start()
-    controller.start()
 
     try:
-        while not controller.get_params()["quit"]:
-            params = controller.get_params()
-            if not params["paused"]:
-                # Generate a new tile
-                tile = generate_tile(
-                    denoiser, params["diffusion_steps"], params["noise_scale"], rng
-                )
-                # Convert to audio
-                audio = inverter.synthesize(tile)
-                # Queue for playback
-                audio_engine.add_segment(audio)
+        config = Config(args.config)
+        if args.device:
+            config.data["device"] = args.device
+        if args.steps:
+            config.data["diffusion_steps"] = args.steps
+        if args.tempo:
+            config.data["tempo"] = args.tempo
 
-                # Compute sleep time based on tempo (beats per minute)
-                # Each tile corresponds to roughly one beat?
-                # For simplicity, we generate at a fixed rate.
-                bpm = params["tempo"]
-                sleep_time = 60.0 / bpm  # seconds per beat
-                time.sleep(sleep_time)
-            else:
-                time.sleep(0.1)
-    except KeyboardInterrupt:
-        print("\nInterrupted.")
-    finally:
-        controller.stop()
-        audio_engine.stop()
+        logger.info("Configuration loaded: %s", config.data)
+
+        # Initialize components
+        sample_rate = config.data["sample_rate"]
+        n_freq = config.data["n_freq"]
+        n_frames = config.data["n_frames"]
+        hidden_channels = config.data["hidden_channels"]
+
+        spectrogram = Spectrogram(n_freq=n_freq, n_frames=n_frames)
+        inverse = SpectrumInverse(sample_rate=sample_rate, n_freq=n_freq)
+        denoiser = Denoiser(
+            n_freq=n_freq,
+            n_frames=n_frames,
+            hidden_channels=hidden_channels,
+            schedule=config.data["noise_schedule"],
+        )
+        augmenter = SpectrogramAugmenter()
+        scheduler = Scheduler(
+            sample_rate=sample_rate,
+            n_frames=n_frames,
+            hop_length=n_frames // 2,
+            crossfade_frames=8,
+        )
+        audio_engine = AudioEngine(
+            sample_rate=sample_rate,
+            block_size=config.data["block_size"],
+            crossfade_samples=config.data["crossfade_samples"],
+            device=config.data["device"],
+        )
+
+        # Start audio engine
+        audio_engine.start()
+
+        logger.info("Diffusion Music Box started. Press Ctrl+C to stop.")
+
+        # Main loop: generate and play segments
+        step = 0
+        try:
+            while True:
+                # Generate a noise tile
+                noise = np.random.randn(n_freq, n_frames).astype(np.float32)
+                # Augment the noise for variation
+                noise = augmenter.random_time_shift(noise, max_shift=8)
+                noise = augmenter.random_freq_shift(noise, max_shift=4)
+                noise = augmenter.random_scale(noise, scale_range=(0.9, 1.1))
+
+                # Run diffusion denoising
+                tile = denoiser.denoise(noise, steps=config.data["diffusion_steps"])
+
+                # Schedule the tile (handles overlap/crossfade)
+                segment = scheduler.schedule(tile)
+
+                # Convert to audio and play
+                audio = inverse.synthesize(segment)
+                audio_engine.play(audio)
+
+                # Wait for the segment duration
+                duration = len(audio) / sample_rate
+                time.sleep(duration * 0.5)  # Overlap with next generation
+
+                step += 1
+                if step % 10 == 0:
+                    logger.info("Generated segment %d", step)
+
+        except KeyboardInterrupt:
+            logger.info("Stopping...")
+        finally:
+            audio_engine.stop()
+
+        return 0
+
+    except Exception as e:
+        logger.error("Fatal error: %s", e, exc_info=True)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
