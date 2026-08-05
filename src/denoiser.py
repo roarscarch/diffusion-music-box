@@ -2,125 +2,82 @@ import numpy as np
 
 
 class Denoiser:
-    """A lightweight U-Net-like denoiser for spectrogram tiles.
+    """Iterative diffusion denoiser for spectrogram tiles.
 
-    The denoiser operates on 2D spectrogram tiles with shape (n_freq, n_frames).
-    It uses a stack of 1D convolutions along the frequency axis to progressively
-    denoise the input, mirroring the architecture described in the project README.
+    This module implements a lightweight diffusion process on 2D frequency-time
+    tiles. The denoiser applies a series of steps that progressively remove
+    noise from a spectrogram, using a simple spectral gating mechanism combined
+    with a learned noise schedule. The result is a smooth, evolving ambient
+    texture that can be converted back to audio.
 
     Parameters
     ----------
-    n_freq : int
-        Number of frequency bins.
-    n_frames : int
-        Number of time frames per tile.
-    hidden_channels : int
-        Number of channels in the hidden layers.
+    noise_schedule : Scheduler
+        Scheduler that defines the noise levels for each diffusion step.
+    steps : int, optional
+        Number of diffusion steps to run per generation call. Defaults to 50.
     """
 
-    def __init__(self, n_freq=257, n_frames=128, hidden_channels=64):
-        self.n_freq = n_freq
-        self.n_frames = n_frames
-        self.hidden_channels = hidden_channels
+    def __init__(self, noise_schedule, steps=50):
+        self.noise_schedule = noise_schedule
+        self.steps = steps
 
-        # Simple weight initialization for 1D convolutions.
-        # In a real implementation, these would be learned parameters.
-        # Here, we use fixed random weights to provide a functional denoiser.
-        rng = np.random.default_rng(42)
-        self.w1 = rng.normal(0, 0.1, (hidden_channels, 1, 5)) / np.sqrt(5)
-        self.b1 = np.zeros(hidden_channels)
-        self.w2 = rng.normal(0, 0.1, (hidden_channels, hidden_channels, 5)) / np.sqrt(5)
-        self.b2 = np.zeros(hidden_channels)
-        self.w3 = rng.normal(0, 0.1, (1, hidden_channels, 5)) / np.sqrt(5)
-        self.b3 = np.zeros(1)
-
-    def _conv1d(self, x, w, b):
-        """Apply 1D convolution along the last axis (time).
+    def denoise(self, tile, current_step=None):
+        """Run one denoising step on a spectrogram tile.
 
         Parameters
         ----------
-        x : np.ndarray
-            Input of shape (..., n_frames).
-        w : np.ndarray
-            Weight of shape (out_channels, in_channels, kernel_size).
-        b : np.ndarray
-            Bias of shape (out_channels,).
+        tile : np.ndarray
+            2D array representing a spectrogram tile (frequency x time).
+        current_step : int, optional
+            The current diffusion step index. If None, uses the internal step counter.
 
         Returns
         -------
-        y : np.ndarray
-            Output of shape (..., out_channels, n_frames - kernel_size + 1).
+        np.ndarray
+            Denoised tile.
         """
-        kernel_size = w.shape[-1]
-        out_len = x.shape[-1] - kernel_size + 1
-        out_channels = w.shape[0]
-        y = np.zeros(x.shape[:-1] + (out_channels, out_len), dtype=x.dtype)
-        for i in range(kernel_size):
-            # slice input: [..., i:i+out_len]
-            x_slice = x[..., i:i + out_len]
-            # w[:, :, i] shape (out_channels, in_channels)
-            # We need to multiply and sum over in_channels (axis=-2)
-            # For simplicity, assume in_channels is 1 or equal to x's last dim? Actually x is 2D (n_freq, n_frames), so in_channels must be 1.
-            # But our x might have multiple channels after first conv. We'll handle by reshaping.
-            # General approach: treat x as (..., in_channels, times) and w as (out_channels, in_channels, k).
-            # We'll do a loop over in_channels.
-            pass
-        # Simplified: use np.convolve for 1D
-        # Actually, we'll implement a straightforward convolution manually.
-        # Let's write a correct implementation.
-        # x shape: (..., n_frames)
-        # w shape: (out_channels, in_channels, kernel_size)
-        # We need to handle in_channels. We'll pad x with a channel dimension.
-        # Convert x to shape (..., 1, n_frames) if 2D.
-        if x.ndim == 2:
-            x = x[:, np.newaxis, :]  # (n_freq, 1, n_frames)
-        in_channels = w.shape[1]
-        # x shape: (..., in_channels, n_frames)
-        out = np.zeros(x.shape[:-2] + (out_channels, out_len), dtype=x.dtype)
-        for oc in range(out_channels):
-            for ic in range(in_channels):
-                # convolve along last axis
-                kernel = w[oc, ic, :]
-                # Use np.convolve with mode='valid'
-                conv = np.apply_along_axis(lambda m: np.convolve(m, kernel, mode='valid'), axis=-1, arr=x[..., ic, :])
-                # conv shape: (..., out_len)
-                out[..., oc, :] += conv
-            out[..., oc, :] += b[oc]
-        return out
+        if current_step is None:
+            current_step = self.steps - 1
+        # Compute noise level for this step
+        noise_level = self.noise_schedule.get_noise(current_step)
+        # Simple spectral gating: keep only magnitudes above a threshold
+        # that depends on the noise level
+        threshold = noise_level * 0.5
+        # Apply soft thresholding (shrinkage) to the magnitude spectrum
+        # This is a placeholder for a more sophisticated denoiser
+        magnitude = np.abs(tile)
+        phase = np.angle(tile)
+        # Soft threshold
+        magnitude_denoised = np.maximum(magnitude - threshold, 0)
+        # Reconstruct with original phase
+        tile_denoised = magnitude_denoised * np.exp(1j * phase)
+        return tile_denoised
 
-    def forward(self, x):
-        """Apply the denoiser to a spectrogram tile.
+    def generate(self, tile_shape, rng=None):
+        """Generate a new spectrogram tile by iteratively denoising pure noise.
 
         Parameters
         ----------
-        x : np.ndarray
-            Input tile of shape (n_freq, n_frames).
+        tile_shape : tuple of int
+            Shape of the tile (freq_bins, time_frames).
+        rng : np.random.Generator, optional
+            Random number generator for reproducibility.
 
         Returns
         -------
-        y : np.ndarray
-            Denoised tile of same shape as input.
+        np.ndarray
+            Generated spectrogram tile (complex-valued).
         """
-        # Ensure input is 2D
-        assert x.ndim == 2, "Input must be 2D"
-        # Pad to preserve dimensions (since convolutions shrink)
-        # We'll use 'same' padding via manual padding.
-        # For simplicity, we'll just do valid convolutions and then resize.
-        # But to keep shape, we'll pad input before each conv.
-        pad = 2  # kernel_size // 2
-        x_padded = np.pad(x, ((0, 0), (pad, pad)), mode='reflect')
-        h1 = self._conv1d(x_padded, self.w1, self.b1)  # (n_freq, hidden_channels, n_frames)
-        h1 = np.maximum(h1, 0)  # ReLU
-        # Second conv, pad h1
-        h1_padded = np.pad(h1, ((0, 0), (0, 0), (pad, pad)), mode='reflect')
-        h2 = self._conv1d(h1_padded, self.w2, self.b2)  # (n_freq, hidden_channels, n_frames)
-        h2 = np.maximum(h2, 0)
-        # Third conv
-        h2_padded = np.pad(h2, ((0, 0), (0, 0), (pad, pad)), mode='reflect')
-        y = self._conv1d(h2_padded, self.w3, self.b3)  # (n_freq, 1, n_frames)
-        # Squeeze channel dim
-        y = y[..., 0, :]  # (n_freq, n_frames)
-        return y
-
-    def __call__(self, x):
-        return self.forward(x)
+        if rng is None:
+            rng = np.random.default_rng()
+        # Start from complex noise
+        noise = rng.standard_normal(tile_shape) + 1j * rng.standard_normal(tile_shape)
+        tile = noise
+        for step in reversed(range(self.steps)):
+            tile = self.denoise(tile, current_step=step)
+            # Add a small amount of noise back to keep the process stochastic
+            noise_level = self.noise_schedule.get_noise(step)
+            if noise_level > 0:
+                tile = tile + noise_level * (rng.standard_normal(tile_shape) + 1j * rng.standard_normal(tile_shape))
+        return tile
