@@ -42,47 +42,44 @@ class SpectrogramAugmenter:
         return tile * scale
 
     def random_brightness(self, tile, delta_range=(-0.05, 0.05)):
-        """Add a random constant offset to the tile."""
+        """Add a random constant offset to all values in the tile.
+
+        This simulates a brightness change in the spectrogram, which can
+        help the model adapt to varying overall intensity levels.
+
+        Parameters
+        ----------
+        tile : np.ndarray
+            Input spectrogram tile (2D array).
+        delta_range : tuple of float, optional
+            Range of additive offset values.
+
+        Returns
+        -------
+        np.ndarray
+            Brightness-augmented tile.
+        """
         delta = self.rng.uniform(*delta_range)
         return tile + delta
 
-    def random_noise(self, tile, noise_level=0.02):
-        """Add small Gaussian noise to the tile."""
-        noise = self.rng.normal(0, noise_level, tile.shape)
-        return tile + noise
+    def random_contrast(self, tile, factor_range=(0.9, 1.1)):
+        """Multiply the tile by a random contrast factor around the mean.
 
-    def random_freq_mask(self, tile, max_masks=2, mask_width=4):
-        """Randomly zero out a few frequency bands."""
-        n_masks = self.rng.integers(0, max_masks + 1)
-        for _ in range(n_masks):
-            start = self.rng.integers(0, tile.shape[-2] - mask_width)
-            tile[..., start:start+mask_width, :] = 0.0
-        return tile
+        This adjusts the dynamic range of the spectrogram, making it
+        more or less contrasting relative to its mean value.
 
-    def random_time_mask(self, tile, max_masks=2, mask_width=4):
-        """Randomly zero out a few time steps."""
-        n_masks = self.rng.integers(0, max_masks + 1)
-        for _ in range(n_masks):
-            start = self.rng.integers(0, tile.shape[-1] - mask_width)
-            tile[..., :, start:start+mask_width] = 0.0
-        return tile
+        Parameters
+        ----------
+        tile : np.ndarray
+            Input spectrogram tile (2D array).
+        factor_range : tuple of float, optional
+            Range of contrast multiplication factors.
 
-    def apply_all(self, tile):
-        """Apply a random combination of augmentations."""
-        # Randomly select a subset of augmentation functions
-        funcs = [
-            self.random_time_shift,
-            self.random_freq_shift,
-            self.random_scale,
-            self.random_brightness,
-            self.random_noise,
-            self.random_freq_mask,
-            self.random_time_mask,
-        ]
-        # Shuffle and apply a random number (0 to all)
-        self.rng.shuffle(funcs)
-        n_apply = self.rng.integers(0, len(funcs) + 1)
-        result = tile.copy()
-        for fn in funcs[:n_apply]:
-            result = fn(result)
-        return result
+        Returns
+        -------
+        np.ndarray
+            Contrast-augmented tile.
+        """
+        factor = self.rng.uniform(*factor_range)
+        mean = tile.mean()
+        return (tile - mean) * factor + mean
