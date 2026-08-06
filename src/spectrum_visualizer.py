@@ -1,130 +1,93 @@
 import numpy as np
-import threading
-import time
+import matplotlib.pyplot as plt
 
 
-class SpectrumVisualizer:
-    """Displays a real-time spectrum visualization in the terminal.
+class SpectrogramVisualizer:
+    """Visualize spectrogram tiles for debugging and monitoring.
 
-    This module provides a simple ASCII-based visualization of the audio
-    spectrum for the given audio buffer. It runs in a separate thread and
-    updates the display at a configurable refresh rate.
-
-    Parameters
-    ----------
-    sample_rate : int
-        Sample rate of the audio data.
-    block_size : int
-        Number of samples per block.
-    refresh_rate : float
-        Refresh rate in Hz for the visualization.
-    n_bars : int
-        Number of bars to display in the ASCII spectrum.
+    This class provides a simple interface to display 2D spectrogram tiles
+    as heatmaps. It is intended for offline analysis and debugging of the
+    generated spectrograms, not for real-time display during playback.
     """
 
-    def __init__(self, sample_rate=22050, block_size=1024, refresh_rate=10.0, n_bars=40):
-        self.sample_rate = sample_rate
-        self.block_size = block_size
-        self.refresh_rate = refresh_rate
-        self.n_bars = n_bars
+    def __init__(self, cmap='viridis', figsize=(10, 6)):
+        self.cmap = cmap
+        self.figsize = figsize
 
-        self._running = False
-        self._thread = None
-        self._lock = threading.Lock()
-        self._audio_buffer = np.zeros(block_size * 8, dtype=np.float32)
-
-        # Frequencies for the bars (log-spaced)
-        self._freq_edges = np.logspace(
-            np.log10(20.0),
-            np.log10(min(self.sample_rate / 2, 20000.0)),
-            self.n_bars + 1
-        )
-        self._freq_centers = 0.5 * (self._freq_edges[:-1] + self._freq_edges[1:])
-
-    def update_audio(self, audio):
-        """Update the audio buffer for visualization.
+    def show(self, spectrogram, title='Spectrogram', save_path=None):
+        """Display a 2D spectrogram as a heatmap.
 
         Parameters
         ----------
-        audio : np.ndarray
-            New audio samples to add to the visualization buffer.
+        spectrogram : np.ndarray
+            2D array of shape (freq_bins, time_frames).
+        title : str, optional
+            Title of the plot.
+        save_path : str, optional
+            If provided, save the figure to this path instead of showing.
         """
-        if audio is None or len(audio) == 0:
-            return
-        with self._lock:
-            # Shift the buffer and append new samples
-            shift = min(len(audio), len(self._audio_buffer))
-            self._audio_buffer[:-shift] = self._audio_buffer[shift:]
-            self._audio_buffer[-shift:] = audio[-shift:]
+        if spectrogram.ndim != 2:
+            raise ValueError("Spectrogram must be 2D")
 
-    def start(self):
-        """Start the visualization thread."""
-        if self._running:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        fig, ax = plt.subplots(figsize=self.figsize)
+        im = ax.imshow(spectrogram, aspect='auto', cmap=self.cmap, origin='lower')
+        ax.set_xlabel('Time frames')
+        ax.set_ylabel('Frequency bins')
+        ax.set_title(title)
+        plt.colorbar(im, ax=ax)
 
-    def stop(self):
-        """Stop the visualization thread."""
-        self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            self._thread = None
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+        else:
+            plt.show()
 
-    def _run(self):
-        """Main loop for the visualization."""
-        while self._running:
-            self._draw()
-            time.sleep(1.0 / self.refresh_rate)
+    def show_magnitude(self, spectrogram, title='Spectrogram (Magnitude)', save_path=None):
+        """Display the magnitude (absolute value) of a spectrogram.
 
-    def _compute_spectrum(self):
-        """Compute the magnitude spectrum of the current buffer.
-
-        Returns
-        -------
-        np.ndarray
-            Array of shape (n_bars,) with magnitudes in dB normalized to [0, 1].
+        Parameters
+        ----------
+        spectrogram : np.ndarray
+            2D array of complex or real values.
+        title : str, optional
+            Title of the plot.
+        save_path : str, optional
+            If provided, save the figure to this path instead of showing.
         """
-        with self._lock:
-            data = self._audio_buffer.copy()
-        if len(data) < 2:
-            return np.zeros(self.n_bars)
+        magnitude = np.abs(spectrogram)
+        self.show(magnitude, title=title, save_path=save_path)
 
-        # Apply a Hann window to reduce spectral leakage
-        window = np.hanning(len(data))
-        data = data * window
+    def save_animation(self, spectrogram_sequence, output_path, fps=10, title='Spectrogram Animation'):
+        """Save an animation of a sequence of spectrograms as a GIF.
 
-        # Compute FFT
-        spectrum = np.abs(np.fft.rfft(data))
-        freqs = np.fft.rfftfreq(len(data), 1.0 / self.sample_rate)
+        Parameters
+        ----------
+        spectrogram_sequence : list of np.ndarray
+            List of 2D spectrogram tiles.
+        output_path : str
+            Path to save the GIF.
+        fps : int, optional
+            Frames per second.
+        title : str, optional
+            Title for each frame.
+        """
+        try:
+            import matplotlib.animation as animation
+        except ImportError:
+            raise ImportError("matplotlib is required for animation")
 
-        # Map to bars
-        magnitudes = np.zeros(self.n_bars)
-        for i in range(self.n_bars):
-            lo = self._freq_edges[i]
-            hi = self._freq_edges[i + 1]
-            mask = (freqs >= lo) & (freqs < hi)
-            if np.any(mask):
-                magnitudes[i] = np.mean(spectrum[mask])
+        if not spectrogram_sequence:
+            raise ValueError("No spectrograms provided")
 
-        # Convert to dB and normalize
-        with np.errstate(divide="ignore"):
-            db = 20.0 * np.log10(magnitudes + 1e-10)
-        db_min = -80.0
-        db_max = 0.0
-        normalized = (db - db_min) / (db_max - db_min)
-        normalized = np.clip(normalized, 0.0, 1.0)
-        return normalized
+        fig, ax = plt.subplots(figsize=self.figsize)
+        im = ax.imshow(np.abs(spectrogram_sequence[0]), aspect='auto', cmap=self.cmap, origin='lower')
+        ax.set_title(title)
+        plt.colorbar(im, ax=ax)
 
-    def _draw(self):
-        """Draw the ASCII spectrum to stdout."""
-        spectrum = self._compute_spectrum()
-        bars = [int(v * 20.0) for v in spectrum]
-        line = "".join("#" * b + " " * (20 - b) for b in bars)
-        # Clear the current line and print
-        sys.stdout.write("\r" + line)
-        sys.stdout.flush()
+        def update(frame_idx):
+            im.set_array(np.abs(spectrogram_sequence[frame_idx]))
+            return [im]
 
-    def __del__(self):
-        self.stop()
+        ani = animation.FuncAnimation(fig, update, frames=len(spectrogram_sequence), interval=1000/fps)
+        ani.save(output_path, writer='pillow')
+        plt.close(fig)
