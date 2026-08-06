@@ -3,37 +3,34 @@ import threading
 import time
 
 
-class MIDIController:
-    """Keyboard-based control for interactive parameters.
+class MidiController:
+    """Headless MIDI-like control via keyboard.
 
     This controller listens for keyboard input in a background thread and
-    maps keys to parameter adjustments. It is designed to be used in a
-    headless CLI environment, providing a MIDI-like experience without
-    requiring actual MIDI hardware.
+    translates key presses into control signals for the music generation
+    pipeline. It supports adjusting the noise schedule, diffusion steps,
+    tempo, and triggering regeneration of the current segment.
 
     Parameters
     ----------
-    param_holder : object
-        An object with attributes that can be adjusted (e.g., noise_schedule,
-        diffusion_steps, tempo). The controller will modify these in place.
+    update_callback : callable, optional
+        A function that receives a dictionary of parameter updates.
+        The keys are parameter names and values are the new values.
     """
 
-    def __init__(self, param_holder):
-        self.param_holder = param_holder
+    def __init__(self, update_callback=None):
+        self.update_callback = update_callback
         self._running = False
         self._thread = None
-        self._keymap = {
-            'q': ('tempo', -5.0),
-            'w': ('tempo', 5.0),
-            'a': ('diffusion_steps', -1),
-            's': ('diffusion_steps', 1),
-            'z': ('noise_schedule', 'prev'),
-            'x': ('noise_schedule', 'next'),
+        self._lock = threading.Lock()
+        self._parameters = {
+            'noise_schedule': 'linear',
+            'diffusion_steps': 50,
+            'tempo': 120.0,
         }
-        self._schedule_cycle = ['linear', 'cosine', 'quadratic']
 
     def start(self):
-        """Start the input listener thread."""
+        """Start the keyboard listener in a background thread."""
         if self._running:
             return
         self._running = True
@@ -41,69 +38,70 @@ class MIDIController:
         self._thread.start()
 
     def stop(self):
-        """Stop the input listener thread."""
+        """Stop the keyboard listener."""
         self._running = False
-        if self._thread:
+        if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
 
     def _listen(self):
-        """Background loop reading keyboard input."""
-        try:
-            import tty
-            import termios
-            import sys
+        """Background thread that reads keyboard input."""
+        import sys
+        import termios
+        import tty
 
-            fd = sys.stdin.fileno()
-            old_settings = termios.tcgetattr(fd)
-            try:
-                tty.setcbreak(fd)
-                while self._running:
-                    ch = sys.stdin.read(1)
-                    if not ch:
-                        continue
-                    if ch == '\x1b':  # ESC
-                        break
-                    self._handle_key(ch.lower())
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        except ImportError:
-            # Fallback for non-POSIX systems: read lines
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
             while self._running:
-                try:
-                    line = input()
-                    if not line:
-                        continue
-                    self._handle_key(line.strip().lower())
-                except EOFError:
+                ch = sys.stdin.read(1)
+                if not ch:
                     break
-                except KeyboardInterrupt:
-                    break
+                self._handle_key(ch)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     def _handle_key(self, key):
-        """Apply the key mapping to adjust parameters."""
-        if key not in self._keymap:
-            return
-        param, delta = self._keymap[key]
-        if param == 'noise_schedule':
-            self._cycle_schedule(delta)
-        else:
-            current = getattr(self.param_holder, param, None)
-            if current is not None:
-                setattr(self.param_holder, param, current + delta)
-                print(f"{param} = {getattr(self.param_holder, param)}")
+        """Handle a single key press."""
+        with self._lock:
+            params = {}
+            if key == 'n':
+                # Cycle noise schedule
+                current = self._parameters['noise_schedule']
+                schedules = ['linear', 'cosine']
+                idx = schedules.index(current) if current in schedules else 0
+                new = schedules[(idx + 1) % len(schedules)]
+                self._parameters['noise_schedule'] = new
+                params['noise_schedule'] = new
+            elif key == 'd':
+                # Increase diffusion steps
+                steps = min(200, self._parameters['diffusion_steps'] + 10)
+                self._parameters['diffusion_steps'] = steps
+                params['diffusion_steps'] = steps
+            elif key == 'a':
+                # Decrease diffusion steps
+                steps = max(10, self._parameters['diffusion_steps'] - 10)
+                self._parameters['diffusion_steps'] = steps
+                params['diffusion_steps'] = steps
+            elif key == 't':
+                # Increase tempo
+                tempo = min(240.0, self._parameters['tempo'] + 5.0)
+                self._parameters['tempo'] = tempo
+                params['tempo'] = tempo
+            elif key == 'g':
+                # Decrease tempo
+                tempo = max(40.0, self._parameters['tempo'] - 5.0)
+                self._parameters['tempo'] = tempo
+                params['tempo'] = tempo
+            elif key == 'r':
+                # Regenerate current segment
+                params['regenerate'] = True
 
-    def _cycle_schedule(self, direction):
-        """Cycle through noise schedules."""
-        current = getattr(self.param_holder, 'noise_schedule', 'linear')
-        try:
-            idx = self._schedule_cycle.index(current)
-        except ValueError:
-            idx = 0
-        if direction == 'next':
-            idx = (idx + 1) % len(self._schedule_cycle)
-        else:
-            idx = (idx - 1) % len(self._schedule_cycle)
-        new_schedule = self._schedule_cycle[idx]
-        setattr(self.param_holder, 'noise_schedule', new_schedule)
-        print(f"noise_schedule = {new_schedule}")
+            if params and self.update_callback:
+                self.update_callback(params)
+
+    def get_parameters(self):
+        """Return a copy of the current parameters."""
+        with self._lock:
+            return dict(self._parameters)
