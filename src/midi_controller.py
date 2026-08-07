@@ -1,107 +1,71 @@
 import numpy as np
-import threading
-import time
+import mido
 
 
-class MidiController:
-    """Headless MIDI-like control via keyboard.
+class MIDIController:
+    """Handles MIDI input for real-time parameter control.
 
-    This controller listens for keyboard input in a background thread and
-    translates key presses into control signals for the music generation
-    pipeline. It supports adjusting the noise schedule, diffusion steps,
-    tempo, and triggering regeneration of the current segment.
-
-    Parameters
-    ----------
-    update_callback : callable, optional
-        A function that receives a dictionary of parameter updates.
-        The keys are parameter names and values are the new values.
+    This controller listens to MIDI messages on a selected input port and
+    translates them into parameter updates for the generative music system.
+    It supports control change (CC) messages for continuous parameters and
+    note on/off messages for discrete actions (e.g., triggering a new tile).
     """
 
-    def __init__(self, update_callback=None):
-        self.update_callback = update_callback
+    def __init__(self, port_name=None, callback=None):
+        self.port_name = port_name
+        self.callback = callback
+        self._port = None
         self._running = False
-        self._thread = None
-        self._lock = threading.Lock()
-        self._parameters = {
-            'noise_schedule': 'linear',
-            'diffusion_steps': 50,
-            'tempo': 120.0,
-        }
 
-    def start(self):
-        """Start the keyboard listener in a background thread."""
-        if self._running:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._listen, daemon=True)
-        self._thread.start()
+    def open(self):
+        """Open the MIDI input port.
 
-    def stop(self):
-        """Stop the keyboard listener."""
-        self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            self._thread = None
-
-    def _listen(self):
-        """Background thread that reads keyboard input."""
-        import sys
-        import termios
-        import tty
-
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+        Returns
+        -------
+        bool
+            True if the port opened successfully, False otherwise.
+        """
         try:
-            tty.setraw(fd)
-            while self._running:
-                ch = sys.stdin.read(1)
-                if not ch:
-                    break
-                self._handle_key(ch)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            if self.port_name is None:
+                # Use the default input port
+                self._port = mido.open_input()
+            else:
+                self._port = mido.open_input(self.port_name)
+            self._running = True
+            return True
+        except Exception as e:
+            print(f"Failed to open MIDI port: {e}")
+            return False
 
-    def _handle_key(self, key):
-        """Handle a single key press."""
-        with self._lock:
-            params = {}
-            if key == 'n':
-                # Cycle noise schedule
-                current = self._parameters['noise_schedule']
-                schedules = ['linear', 'cosine']
-                idx = schedules.index(current) if current in schedules else 0
-                new = schedules[(idx + 1) % len(schedules)]
-                self._parameters['noise_schedule'] = new
-                params['noise_schedule'] = new
-            elif key == 'd':
-                # Increase diffusion steps
-                steps = min(200, self._parameters['diffusion_steps'] + 10)
-                self._parameters['diffusion_steps'] = steps
-                params['diffusion_steps'] = steps
-            elif key == 'a':
-                # Decrease diffusion steps
-                steps = max(10, self._parameters['diffusion_steps'] - 10)
-                self._parameters['diffusion_steps'] = steps
-                params['diffusion_steps'] = steps
-            elif key == 't':
-                # Increase tempo
-                tempo = min(240.0, self._parameters['tempo'] + 5.0)
-                self._parameters['tempo'] = tempo
-                params['tempo'] = tempo
-            elif key == 'g':
-                # Decrease tempo
-                tempo = max(40.0, self._parameters['tempo'] - 5.0)
-                self._parameters['tempo'] = tempo
-                params['tempo'] = tempo
-            elif key == 'r':
-                # Regenerate current segment
-                params['regenerate'] = True
+    def close(self):
+        """Close the MIDI input port."""
+        if self._port is not None:
+            self._port.close()
+            self._port = None
+        self._running = False
 
-            if params and self.update_callback:
-                self.update_callback(params)
+    def poll(self):
+        """Poll for incoming MIDI messages and dispatch them.
 
-    def get_parameters(self):
-        """Return a copy of the current parameters."""
-        with self._lock:
-            return dict(self._parameters)
+        Call this method regularly from the main loop to process MIDI input.
+        """
+        if not self._running or self._port is None:
+            return
+        for msg in self._port.iter_pending():
+            self._handle_message(msg)
+
+    def _handle_message(self, msg):
+        """Process a single MIDI message.
+
+        Parameters
+        ----------
+        msg : mido.Message
+            The incoming MIDI message.
+        """
+        if msg.type == 'control_change':
+            # Map CC number to parameter name
+            param_map = {
+                1: 'noise_schedule',
+                2: 'diffusion_steps',
+                3: 'tempo',
+            }
