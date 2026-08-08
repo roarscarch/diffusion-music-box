@@ -1,109 +1,159 @@
-import sys
-import termios
-import tty
-import select
+import numpy as np
 import threading
 import time
+from enum import Enum
+
+
+class ControlParam(Enum):
+    NOISE_SCHEDULE = 'noise_schedule'
+    DIFFUSION_STEPS = 'diffusion_steps'
+    TEMPO = 'tempo'
+    GAIN = 'gain'
 
 
 class KeyboardController:
-    """Reads keyboard input in a non-blocking way for real-time parameter control.
+    """Provide real-time parameter control via keyboard input.
 
-    This class runs a background thread that reads single keystrokes from the
-    terminal without requiring the Enter key. It maintains a set of currently
-    pressed keys and provides a callback mechanism for key press/release events.
-    This is useful for headless CLI control of the diffusion music box.
+    This class listens for keyboard events in a background thread and maps
+    key presses to parameter adjustments. It is designed to be used in a
+    headless environment where the user can tweak generation parameters
+    without a GUI.
+
+    The mapping is as follows:
+    - 'n' : increase noise schedule (more noise)
+    - 'N' : decrease noise schedule (less noise)
+    - 's' : increase diffusion steps
+    - 'S' : decrease diffusion steps
+    - 't' : increase tempo (BPM)
+    - 'T' : decrease tempo (BPM)
+    - 'g' : increase gain
+    - 'G' : decrease gain
+    - 'q' : quit (sets a flag)
 
     Parameters
     ----------
-    on_key_press : callable, optional
-        Callback invoked with the key character when a key is pressed.
-    on_key_release : callable, optional
-        Callback invoked with the key character when a key is released.
+    initial_params : dict, optional
+        Initial values for the controllable parameters. Keys should be
+        members of :class:`ControlParam`. If omitted, sensible defaults are
+        used.
     """
 
-    def __init__(self, on_key_press=None, on_key_release=None):
-        self._on_key_press = on_key_press
-        self._on_key_release = on_key_release
-        self._pressed_keys = set()
-        self._stop_event = threading.Event()
+    def __init__(self, initial_params=None):
+        self.params = {
+            ControlParam.NOISE_SCHEDULE: 0.5,
+            ControlParam.DIFFUSION_STEPS: 50,
+            ControlParam.TEMPO: 60.0,
+            ControlParam.GAIN: 0.5,
+        }
+        if initial_params:
+            for key, value in initial_params.items():
+                if key in self.params:
+                    self.params[key] = float(value)
+        self._lock = threading.Lock()
+        self._running = False
         self._thread = None
-        self._fd = sys.stdin.fileno()
-        self._old_settings = None
+        self._quit_flag = False
 
     def start(self):
         """Start the keyboard listener thread."""
-        if self._thread is not None and self._thread.is_alive():
+        if self._running:
             return
-        self._stop_event.clear()
-        self._old_settings = termios.tcgetattr(self._fd)
-        tty.setcbreak(self._fd)
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._running = True
+        self._quit_flag = False
+        self._thread = threading.Thread(target=self._listen, daemon=True)
         self._thread.start()
 
     def stop(self):
-        """Stop the keyboard listener thread and restore terminal settings."""
-        if self._thread is None:
-            return
-        self._stop_event.set()
-        self._thread.join(timeout=1.0)
-        self._thread = None
-        if self._old_settings is not None:
-            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_settings)
-            self._old_settings = None
+        """Stop the keyboard listener thread."""
+        self._running = False
+        self._quit_flag = True
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
 
-    def _run(self):
-        """Background thread loop that reads keystrokes."""
-        while not self._stop_event.is_set():
-            # Check if there is input available
-            rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
-            if not rlist:
-                continue
+    def _listen(self):
+        """Background loop that reads keyboard input."""
+        while self._running:
             try:
-                # Read one byte (character)
-                ch = sys.stdin.read(1)
-                if not ch:
-                    continue
-                if ch not in self._pressed_keys:
-                    self._pressed_keys.add(ch)
-                    if self._on_key_press:
-                        self._on_key_press(ch)
+                # In a real terminal, this would use something like `keyboard`
+                # or `pynput`. For now, we provide a dummy that reads from stdin
+                # with a timeout to keep the loop responsive.
+                import select
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    line = sys.stdin.readline()
+                    if line:
+                        self._handle_key(line.strip())
                 else:
-                    # Key is still held; optionally handle repeat
-                    pass
-            except (IOError, OSError):
+                    time.sleep(0.05)
+            except KeyboardInterrupt:
+                self._quit_flag = True
                 break
-            # Detect key releases by checking if key is no longer in the buffer
-            # This is a simplified approach; for real release detection we'd need
-            # raw escape sequences. Here we just report continuous presses.
-            # We'll also add a small debounce to avoid duplicate events.
-            time.sleep(0.02)
 
-    def get_pressed_keys(self):
-        """Return the set of currently pressed keys."""
-        return set(self._pressed_keys)
+    def _handle_key(self, key):
+        """Process a single key press."""
+        if not key:
+            return
+        # Support both single-character keys and longer strings (e.g., 'N')
+        # We only care about the first character for simplicity.
+        k = key[0]
+        with self._lock:
+            if k == 'q':
+                self._quit_flag = True
+            elif k == 'n':
+                self.params[ControlParam.NOISE_SCHEDULE] = min(1.0, self.params[ControlParam.NOISE_SCHEDULE] + 0.05)
+            elif k == 'N':
+                self.params[ControlParam.NOISE_SCHEDULE] = max(0.0, self.params[ControlParam.NOISE_SCHEDULE] - 0.05)
+            elif k == 's':
+                self.params[ControlParam.DIFFUSION_STEPS] = min(200, int(self.params[ControlParam.DIFFUSION_STEPS]) + 5)
+            elif k == 'S':
+                self.params[ControlParam.DIFFUSION_STEPS] = max(1, int(self.params[ControlParam.DIFFUSION_STEPS]) - 5)
+            elif k == 't':
+                self.params[ControlParam.TEMPO] = min(200.0, self.params[ControlParam.TEMPO] + 2.0)
+            elif k == 'T':
+                self.params[ControlParam.TEMPO] = max(20.0, self.params[ControlParam.TEMPO] - 2.0)
+            elif k == 'g':
+                self.params[ControlParam.GAIN] = min(1.0, self.params[ControlParam.GAIN] + 0.05)
+            elif k == 'G':
+                self.params[ControlParam.GAIN] = max(0.0, self.params[ControlParam.GAIN] - 0.05)
 
-    def clear_pressed_keys(self):
-        """Clear the set of pressed keys."""
-        self._pressed_keys.clear()
+    def get_param(self, param):
+        """Retrieve the current value of a parameter.
 
-    def __enter__(self):
-        self.start()
-        return self
+        Parameters
+        ----------
+        param : ControlParam
+            The parameter to query.
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.stop()
+        Returns
+        -------
+        float or int
+            The current value. Integer values are converted to int for
+            parameters that are inherently integer-based.
+        """
+        with self._lock:
+            val = self.params[param]
+            if param in (ControlParam.DIFFUSION_STEPS,):
+                return int(val)
+            return val
 
+    def set_param(self, param, value):
+        """Set a parameter to a specific value.
 
-if __name__ == "__main__":
-    # Simple demo: print pressed keys
-    def on_press(key):
-        print(f"Pressed: {key!r}")
+        Parameters
+        ----------
+        param : ControlParam
+            The parameter to set.
+        value : float or int
+            The new value.
+        """
+        with self._lock:
+            self.params[param] = float(value)
 
-    with KeyboardController(on_key_press=on_press) as kc:
-        print("Press keys (Ctrl+C to exit)")
-        try:
-            while True:
-                time.sleep(0.1)
-        except KeyboardInterrupt:
-            pass
+    def quit_requested(self):
+        """Return True if the user requested to quit."""
+        return self._quit_flag
+
+    def get_all_params(self):
+        """Return a copy of all current parameters as a dict."""
+        with self._lock:
+            return {k: v for k, v in self.params.items()}
