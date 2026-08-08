@@ -1,86 +1,97 @@
 import argparse
 import sys
+import threading
+import time
 
-from .config import load_config
-from .main import run_generator
+import numpy as np
+
+from .audio_engine import AudioEngine
+from .config import Config
+from .denoiser import Denoiser
+from .generator import Generator
+from .keyboard_controller import KeyboardController
+from .midi_controller import MidiController
+from .spectrogram import Spectrogram
+from .tile_pipeline import TilePipeline
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Build the command-line argument parser."""
-    parser = argparse.ArgumentParser(
-        description="Diffusion Music Box - AI-generated ambient music from noise"
+def parse_args():
+    parser = argparse.ArgumentParser(description="Diffusion Music Box - AI-generated ambient music")
+    parser.add_argument("--sample-rate", type=int, default=22050, help="Audio sample rate")
+    parser.add_argument("--block-size", type=int, default=1024, help="Audio block size")
+    parser.add_argument("--device", type=str, default=None, help="Output device name or index")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--config", type=str, default=None, help="Path to config file")
+    parser.add_argument("--no-keyboard", action="store_true", help="Disable keyboard control")
+    parser.add_argument("--no-midi", action="store_true", help="Disable MIDI control")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    config = Config.load(args.config) if args.config else Config()
+
+    # Override config with CLI arguments if provided
+    if args.sample_rate:
+        config.sample_rate = args.sample_rate
+    if args.block_size:
+        config.block_size = args.block_size
+    if args.device:
+        config.device = args.device
+    if args.seed is not None:
+        config.seed = args.seed
+
+    # Initialize components
+    rng = np.random.default_rng(config.seed)
+    denoiser = Denoiser(config)
+    generator = Generator(config, denoiser, rng)
+    audio_engine = AudioEngine(
+        sample_rate=config.sample_rate,
+        block_size=config.block_size,
+        device=config.device,
     )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help="Path to a JSON/YAML config file (optional)",
-    )
-    parser.add_argument(
-        "--sample-rate",
-        type=int,
-        default=None,
-        help="Audio sample rate (default from config or 22050)",
-    )
-    parser.add_argument(
-        "--blocksize",
-        type=int,
-        default=None,
-        help="Audio block size in samples (default from config or 1024)",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="Output audio device (name or index, default system default)",
-    )
-    parser.add_argument(
-        "--no-keyboard",
-        action="store_true",
-        help="Disable interactive keyboard control",
-    )
-    parser.add_argument(
-        "--list-devices",
-        action="store_true",
-        help="List available audio devices and exit",
-    )
-    return parser
 
+    # Start generation and playback threads
+    stop_event = threading.Event()
 
-def main(argv=None) -> int:
-    """Entry point for the CLI."""
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    def generation_loop():
+        while not stop_event.is_set():
+            tile = generator.generate_tile()
+            audio = TilePipeline.tile_to_audio(tile, config)
+            audio_engine.add_segment(audio)
+            time.sleep(0.1)  # small delay to avoid busy loop
 
-    if args.list_devices:
-        import sounddevice as sd
+    gen_thread = threading.Thread(target=generation_loop, daemon=True)
+    gen_thread.start()
 
-        print(sd.query_devices())
-        return 0
+    audio_engine.start()
 
-    # Load config if provided
-    config = load_config(args.config) if args.config else {}
+    # Set up control interfaces
+    controllers = []
+    if not args.no_keyboard:
+        keyboard = KeyboardController(generator, config)
+        keyboard.start()
+        controllers.append(keyboard)
+    if not args.no_midi:
+        midi = MidiController(generator, config)
+        midi.start()
+        controllers.append(midi)
 
-    # Merge CLI overrides
-    if args.sample_rate is not None:
-        config["sample_rate"] = args.sample_rate
-    if args.blocksize is not None:
-        config["block_size"] = args.blocksize
-    if args.device is not None:
-        config["device"] = args.device
+    print("Diffusion Music Box running. Press Ctrl+C to stop.")
 
-    # Run the generator
     try:
-        run_generator(config, use_keyboard=not args.no_keyboard)
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("\nStopped.")
-        return 0
-    except Exception as exc:  # pragma: no cover
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-
-    return 0
+        pass
+    finally:
+        stop_event.set()
+        audio_engine.stop()
+        for c in controllers:
+            c.stop()
+        gen_thread.join(timeout=2)
+        print("Stopped.")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
