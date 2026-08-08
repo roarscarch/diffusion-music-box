@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diffusion-music-box"
+version = "0.1.0"
+description = "AI-generated ambient music from noise"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    {name = "AI Automation Pipeline"}
+]
+license = {text = "MIT"}
+keywords = ["audio", "diffusion", "ambient", "music", "spectrogram"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Topic :: Multimedia :: Sound/Audio :: Synthesis",
+]
+
+[project.urls]
+Homepage = "https://github.com/example/diffusion-music-box"
+Repository = "https://github.com/example/diffusion-music-box"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black>=23.0",
+    "flake8>=6.0",
+    "isort>=5.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 120
+
+[tool.isort]
+profile = "black"
+line_length = 120
