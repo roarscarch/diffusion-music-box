@@ -1,71 +1,87 @@
-import numpy as np
 import mido
+import threading
+from typing import Callable, Dict, Optional
 
 
-class MIDIController:
-    """Handles MIDI input for real-time parameter control.
+class MidiController:
+    """Listens to MIDI control change messages and maps them to parameter callbacks.
 
-    This controller listens to MIDI messages on a selected input port and
-    translates them into parameter updates for the generative music system.
-    It supports control change (CC) messages for continuous parameters and
-    note on/off messages for discrete actions (e.g., triggering a new tile).
+    This class opens a MIDI input port and runs a background thread that
+    processes incoming control change (CC) messages. Each CC number can be
+    mapped to a callback function that receives the normalized value (0.0 to 1.0).
+
+    Parameters
+    ----------
+    port_name : str, optional
+        Name of the MIDI input port to open. If None, the default input port is used.
     """
 
-    def __init__(self, port_name=None, callback=None):
+    def __init__(self, port_name: Optional[str] = None):
         self.port_name = port_name
-        self.callback = callback
-        self._port = None
+        self._callbacks: Dict[int, Callable[[float], None]] = {}
+        self._thread: Optional[threading.Thread] = None
         self._running = False
+        self._port = None
 
-    def open(self):
-        """Open the MIDI input port.
+    def open(self) -> bool:
+        """Open the MIDI input port and start the listener thread.
 
         Returns
         -------
         bool
-            True if the port opened successfully, False otherwise.
+            True if the port was opened successfully, False otherwise.
         """
         try:
             if self.port_name is None:
-                # Use the default input port
                 self._port = mido.open_input()
             else:
                 self._port = mido.open_input(self.port_name)
-            self._running = True
-            return True
-        except Exception as e:
-            print(f"Failed to open MIDI port: {e}")
+        except (OSError, ValueError, IOError):
             return False
+        self._running = True
+        self._thread = threading.Thread(target=self._listen, daemon=True)
+        self._thread.start()
+        return True
 
-    def close(self):
-        """Close the MIDI input port."""
+    def close(self) -> None:
+        """Stop the listener thread and close the MIDI port."""
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
         if self._port is not None:
             self._port.close()
             self._port = None
-        self._running = False
 
-    def poll(self):
-        """Poll for incoming MIDI messages and dispatch them.
-
-        Call this method regularly from the main loop to process MIDI input.
-        """
-        if not self._running or self._port is None:
-            return
-        for msg in self._port.iter_pending():
-            self._handle_message(msg)
-
-    def _handle_message(self, msg):
-        """Process a single MIDI message.
+    def set_callback(self, cc_number: int, callback: Callable[[float], None]) -> None:
+        """Register a callback for a specific control change number.
 
         Parameters
         ----------
-        msg : mido.Message
-            The incoming MIDI message.
+        cc_number : int
+            MIDI control change number (0-127).
+        callback : Callable[[float], None]
+            Function that takes a normalized value (0.0-1.0) as input.
         """
-        if msg.type == 'control_change':
-            # Map CC number to parameter name
-            param_map = {
-                1: 'noise_schedule',
-                2: 'diffusion_steps',
-                3: 'tempo',
-            }
+        self._callbacks[cc_number] = callback
+
+    def _listen(self) -> None:
+        """Background thread loop that processes incoming MIDI messages."""
+        while self._running:
+            try:
+                msg = self._port.receive(block=True)
+                if msg.type == 'control_change':
+                    cc = msg.control
+                    if cc in self._callbacks:
+                        # Normalize value 0-127 to 0.0-1.0
+                        normalized = msg.value / 127.0
+                        self._callbacks[cc](normalized)
+            except (OSError, ValueError, IOError):
+                break
+
+    @staticmethod
+    def list_input_ports() -> list:
+        """Return a list of available MIDI input ports."""
+        try:
+            return mido.get_input_names()
+        except Exception:
+            return []
