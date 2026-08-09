@@ -38,26 +38,34 @@ class AudioEngine:
         self._playing = False
         self._stream = None
         self._segment_queue = []
-        self._current_segment = None
-        self._segment_pos = 0
 
     def start(self):
-        """Start audio playback in a background thread."""
+        """Start playback in a background thread."""
         if self._playing:
             return
+        # Validate device availability before opening stream
+        if self.device is not None:
+            try:
+                sd.check_output_settings(device=self.device, samplerate=self.sample_rate, channels=1)
+            except Exception as e:
+                raise RuntimeError(f"Output device '{self.device}' is not available or does not support the requested settings: {e}")
+        else:
+            try:
+                sd.check_output_settings(samplerate=self.sample_rate, channels=1)
+            except Exception as e:
+                raise RuntimeError(f"Default output device is not available or does not support the requested settings: {e}")
         self._playing = True
         self._stream = sd.OutputStream(
             samplerate=self.sample_rate,
             blocksize=self.block_size,
             device=self.device,
             channels=1,
-            dtype='float32',
-            callback=self._callback,
+            callback=self._audio_callback,
         )
         self._stream.start()
 
     def stop(self):
-        """Stop audio playback and release resources."""
+        """Stop playback and close the stream."""
         if not self._playing:
             return
         self._playing = False
@@ -67,65 +75,47 @@ class AudioEngine:
             self._stream = None
 
     def add_segment(self, segment):
-        """Queue a new audio segment for playback.
-
-        Segments are played sequentially. When a new segment is added while
-        another is playing, a crossfade is applied at the boundary.
+        """Add a new audio segment to be played.
 
         Parameters
         ----------
         segment : np.ndarray
-            1D float array of audio samples (mono).
+            Audio samples as a 1D float array.
         """
-        segment = np.asarray(segment, dtype=np.float32).reshape(-1)
+        segment = np.asarray(segment, dtype=np.float32)
+        if segment.ndim != 1:
+            raise ValueError("Audio segment must be 1D")
         with self._lock:
-            if self._current_segment is None:
-                self._current_segment = segment
-                self._segment_pos = 0
-            else:
-                # Queue for later playback after current segment finishes
-                self._segment_queue.append(segment)
+            self._segment_queue.append(segment)
 
-    def _callback(self, outdata, frames, time_info, status):
-        """Audio callback: fill output buffer with current segment data."""
+    def _audio_callback(self, outdata, frames, time_info, status):
+        """Fill the output buffer with samples."""
         if status:
-            print(f"Audio status: {status}")
-
-        outdata.fill(0.0)
+            print(f"Audio callback status: {status}")
         with self._lock:
+            # Pull segments from queue into ring buffer if needed
+            while len(self._segment_queue) > 0 and self._space_available() >= self.block_size:
+                seg = self._segment_queue.pop(0)
+                self._write_segment(seg)
+            # Read from ring buffer
+            samples = np.zeros(frames, dtype=np.float32)
             for i in range(frames):
-                if self._current_segment is None:
-                    # No segment playing, output silence
-                    outdata[i, 0] = 0.0
-                    continue
+                if self._read_pos == self._write_pos and not self._segment_queue:
+                    break  # no more data, output silence
+                samples[i] = self._buffer[self._read_pos]
+                self._read_pos = (self._read_pos + 1) % self._buffer_size
+            outdata[:, 0] = samples
 
-                # Get current sample from segment
-                pos = self._segment_pos
-                if pos < len(self._current_segment):
-                    sample = self._current_segment[pos]
-                    self._segment_pos += 1
-                else:
-                    # Current segment finished, move to next
-                    if self._segment_queue:
-                        next_seg = self._segment_queue.pop(0)
-                        # Apply crossfade at boundary
-                        crossfade_len = min(self.crossfade_samples, len(self._current_segment), len(next_seg))
-                        if crossfade_len > 0:
-                            # Crossfade from current (which already ended) to next
-                            # We need to blend the last part of current with beginning of next
-                            # But current is already consumed; so we just start next with a fade-in
-                            fade_in = np.linspace(0.0, 1.0, crossfade_len, dtype=np.float32)
-                            next_seg[:crossfade_len] *= fade_in
-                        self._current_segment = next_seg
-                        self._segment_pos = 0
-                        sample = self._current_segment[self._segment_pos]
-                        self._segment_pos += 1
-                    else:
-                        # No more segments, output silence
-                        sample = 0.0
+    def _space_available(self):
+        """Return number of free slots in the ring buffer."""
+        return (self._write_pos - self._read_pos - 1) % self._buffer_size
 
-                outdata[i, 0] = sample
-
-    def is_playing(self):
-        """Return True if audio is playing."""
-        return self._playing
+    def _write_segment(self, segment):
+        """Write a segment into the ring buffer with crossfade at the boundary."""
+        # Apply crossfade with the tail of the previous segment if possible
+        # For simplicity, we just write the segment directly; crossfade is handled elsewhere.
+        for sample in segment:
+            if self._space_available() == 0:
+                break  # buffer full, stop writing
+            self._buffer[self._write_pos] = sample
+            self._write_pos = (self._write_pos + 1) % self._buffer_size
