@@ -1,111 +1,148 @@
-import threading
 import time
+import threading
 
 
-class MidiClockSync:
-    """Synchronize the music generation tempo with an external MIDI clock.
+class MidiClock:
+    """A MIDI clock for synchronizing generated audio with external devices.
 
-    This module listens for MIDI clock messages (typically 24 pulses per
-    quarter note) and provides a tempo estimate that can be used to update
-    the generation scheduler in real time. It supports starting/stopping
-    the clock and resetting the beat position.
+    This module implements a simple MIDI clock that can be used to pace the
+    generation of audio segments according to a tempo (in BPM). It provides
+    a thread-safe way to query the current beat position and to wait for the
+    next beat. The clock can be started, stopped, and reset, and it supports
+    a callback that is invoked on each beat.
 
     Parameters
     ----------
-    ppqn : int, optional
-        Pulses per quarter note (standard MIDI clock is 24).
-    smoothing : float, optional
-        Exponential smoothing factor for tempo updates (0.0 to 1.0).
-        Higher values give more weight to recent measurements.
+    bpm : float
+        Tempo in beats per minute.
+    beats_per_bar : int, optional
+        Number of beats per bar (default 4).
     """
 
-    def __init__(self, ppqn=24, smoothing=0.2):
-        self.ppqn = ppqn
-        self.smoothing = smoothing
+    def __init__(self, bpm=120.0, beats_per_bar=4):
+        self.bpm = bpm
+        self.beats_per_bar = beats_per_bar
+        self._beat_interval = 60.0 / bpm
+        self._start_time = None
+        self._beat_count = 0
         self._lock = threading.Lock()
         self._running = False
-        self._last_pulse_time = None
-        self._tempo = None  # beats per minute
-        self._pulses_since_start = 0
-        self._start_time = None
+        self._beat_callback = None
+
+    @property
+    def beat_interval(self):
+        """Return the time interval between beats in seconds."""
+        return self._beat_interval
+
+    def set_bpm(self, bpm):
+        """Update the tempo.
+
+        This updates the beat interval and, if the clock is running,
+        recalculates the start time to keep the phase continuous.
+
+        Parameters
+        ----------
+        bpm : float
+            New tempo in beats per minute.
+        """
+        with self._lock:
+            if bpm <= 0:
+                raise ValueError("BPM must be positive")
+            self.bpm = bpm
+            new_interval = 60.0 / bpm
+            if self._running and self._start_time is not None:
+                # Keep the current beat phase by adjusting start time
+                elapsed = time.time() - self._start_time
+                beat_pos = elapsed / self._beat_interval
+                self._start_time = time.time() - beat_pos * new_interval
+            self._beat_interval = new_interval
 
     def start(self):
-        """Start or restart the MIDI clock."""
-        with self._lock:
-            self._running = True
-            self._last_pulse_time = None
-            self._tempo = None
-            self._pulses_since_start = 0
-            self._start_time = time.time()
-
-    def stop(self):
-        """Stop the MIDI clock and clear tempo state."""
-        with self._lock:
-            self._running = False
-            self._tempo = None
-            self._last_pulse_time = None
-            self._pulses_since_start = 0
-            self._start_time = None
-
-    def reset(self):
-        """Reset the beat position without stopping the clock."""
-        with self._lock:
-            self._pulses_since_start = 0
-            self._start_time = time.time()
-            self._last_pulse_time = None
-
-    def pulse(self):
-        """Process a single MIDI clock pulse."""
-        now = time.time()
+        """Start the clock."""
         with self._lock:
             if not self._running:
-                return
-            if self._last_pulse_time is not None:
-                delta = now - self._last_pulse_time
-                if delta > 0:
-                    # Tempo in BPM = 60 / (delta * ppqn)
-                    instant_bpm = 60.0 / (delta * self.ppqn)
-                    if self._tempo is None:
-                        self._tempo = instant_bpm
-                    else:
-                        self._tempo = (self.smoothing * instant_bpm +
-                                       (1 - self.smoothing) * self._tempo)
-            self._last_pulse_time = now
-            self._pulses_since_start += 1
+                self._start_time = time.time()
+                self._running = True
+                self._beat_count = 0
 
-    def get_tempo(self):
-        """Return the current tempo estimate in BPM.
-
-        Returns
-        -------
-        float or None
-            Estimated tempo in beats per minute, or None if not enough data.
-        """
+    def stop(self):
+        """Stop the clock."""
         with self._lock:
-            return self._tempo
+            self._running = False
+            self._start_time = None
+            self._beat_count = 0
+
+    def reset(self):
+        """Reset the clock to zero and stop it."""
+        with self._lock:
+            self._running = False
+            self._start_time = None
+            self._beat_count = 0
+
+    def is_running(self):
+        """Return True if the clock is running."""
+        with self._lock:
+            return self._running
+
+    def get_beat_count(self):
+        """Return the current beat count (0-based)."""
+        with self._lock:
+            return self._beat_count
 
     def get_beat_position(self):
-        """Return the current beat position since start/reset.
-
-        Returns
-        -------
-        float
-            Beat position in beats (fractional). Returns 0 if not running.
-        """
+        """Return the current beat position as a float (fractional beats)."""
         with self._lock:
             if not self._running or self._start_time is None:
                 return 0.0
             elapsed = time.time() - self._start_time
-            if self._tempo is None:
-                return 0.0
-            return elapsed * self._tempo / 60.0
+            return elapsed / self._beat_interval
 
-    def is_running(self):
-        """Return whether the MIDI clock is active."""
-        with self._lock:
-            return self._running
+    def wait_for_next_beat(self):
+        """Block until the next beat boundary occurs.
 
-    def set_tempo(self, bpm):
-        """Manually set the tempo (useful for testing or fallback)."""
+        Returns
+        -------
+        int
+            The beat count after the wait.
+        """
         with self._lock:
-            self._tempo = float(bpm)
+            if not self._running:
+                raise RuntimeError("Clock is not running")
+            current_beat = self.get_beat_position()
+            next_beat = int(current_beat) + 1
+            wait_time = (next_beat - current_beat) * self._beat_interval
+            # Release lock while sleeping
+        time.sleep(wait_time)
+        with self._lock:
+            self._beat_count = int(self.get_beat_position())
+            if self._beat_callback:
+                self._beat_callback(self._beat_count)
+            return self._beat_count
+
+    def set_beat_callback(self, callback):
+        """Set a callback to be invoked on each beat.
+
+        Parameters
+        ----------
+        callback : callable
+            Function taking a single integer beat count.
+        """
+        with self._lock:
+            self._beat_callback = callback
+
+    def get_next_beat_time(self):
+        """Return the absolute time (seconds) of the next beat."""
+        with self._lock:
+            if not self._running or self._start_time is None:
+                return None
+            current = self.get_beat_position()
+            next_beat = int(current) + 1
+            return self._start_time + next_beat * self._beat_interval
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *args):
+        self.stop()
+}
