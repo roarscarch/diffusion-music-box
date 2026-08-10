@@ -2,87 +2,132 @@ import numpy as np
 
 
 class NoiseSchedule:
-    """Manage noise levels for the diffusion process.
+    """Generate noise schedules for iterative diffusion.
 
-    This class provides linear and cosine beta schedules, which determine
-    how much noise is added at each diffusion step. The schedule can be
-    used to compute alpha and alpha_bar values for forward and reverse
-    diffusion processes.
+    This module provides different noise schedules (e.g., linear, cosine,
+    quadratic) that control the amount of noise added at each diffusion step.
+    It is used by the denoiser to gradually denoise a spectrogram tile from
+    pure noise to a coherent audio structure.
+
+    Parameters
+    ----------
+    schedule_type : str, optional
+        Type of schedule: 'linear', 'cosine', 'quadratic', or 'sqrt'.
+    total_steps : int, optional
+        Number of diffusion steps. Default is 10.
+    beta_start : float, optional
+        Starting noise level for linear schedule. Default is 0.0001.
+    beta_end : float, optional
+        Ending noise level for linear schedule. Default is 0.02.
     """
 
-    def __init__(self, steps=100, schedule_type='linear', beta_start=0.0001, beta_end=0.02):
-        """
-        Parameters
-        ----------
-        steps : int
-            Number of diffusion steps.
-        schedule_type : str
-            Type of schedule: 'linear' or 'cosine'.
-        beta_start : float
-            Starting beta value for linear schedule.
-        beta_end : float
-            Ending beta value for linear schedule.
-        """
-        self.steps = steps
+    def __init__(self, schedule_type='linear', total_steps=10,
+                 beta_start=0.0001, beta_end=0.02):
         self.schedule_type = schedule_type
+        self.total_steps = total_steps
         self.beta_start = beta_start
         self.beta_end = beta_end
-        self.betas = self._compute_betas()
-        self.alphas = 1.0 - self.betas
-        self.alpha_bars = np.cumprod(self.alphas)
+        self._betas = None
+        self._alphas = None
+        self._alpha_cumprod = None
+        self._compute()
 
-    def _compute_betas(self):
-        """Compute beta values for the chosen schedule."""
+    def _compute(self):
+        """Compute the noise schedule arrays.
+
+        Stores beta, alpha, and cumulative alpha (alpha_cumprod) arrays.
+        The schedule defines the variance of the noise added at each step.
+        """
+        steps = self.total_steps
         if self.schedule_type == 'linear':
-            return np.linspace(self.beta_start, self.beta_end, self.steps)
+            betas = np.linspace(self.beta_start, self.beta_end, steps)
         elif self.schedule_type == 'cosine':
-            return self._cosine_betas()
+            # Cosine schedule as per improved diffusion (Nichol & Dhariwal)
+            s = 0.008
+            t = np.arange(steps + 1, dtype=np.float64) / steps
+            f_t = np.cos((t + s) / (1 + s) * np.pi / 2) ** 2
+            alphas_cumprod = f_t / f_t[0]
+            betas = np.clip(1 - alphas_cumprod[1:] / alphas_cumprod[:-1], 0, 0.999)
+        elif self.schedule_type == 'quadratic':
+            betas = np.linspace(self.beta_start ** 0.5, self.beta_end ** 0.5, steps) ** 2
+        elif self.schedule_type == 'sqrt':
+            betas = np.sqrt(np.linspace(self.beta_start, self.beta_end, steps))
         else:
             raise ValueError(f"Unknown schedule type: {self.schedule_type}")
 
-    def _cosine_betas(self):
-        """Cosine schedule from 'Improved Denoising Diffusion Probabilistic Models'."""
-        steps = self.steps
-        s = 0.008
-        x = np.linspace(0, steps, steps + 1) / steps
-        alpha_bar = np.cos((x + s) / (1 + s) * (np.pi / 2)) ** 2
-        alpha_bar = alpha_bar / alpha_bar[0]
-        betas = 1.0 - alpha_bar[1:] / alpha_bar[:-1]
-        return np.clip(betas, 0.0, 0.999)
+        self._betas = betas.astype(np.float32)
+        self._alphas = 1.0 - self._betas
+        self._alpha_cumprod = np.cumprod(self._alphas)
 
-    def get_alpha_bar(self, t):
-        """Return alpha_bar at step t (0-indexed)."""
-        return self.alpha_bars[t]
+    @property
+    def betas(self):
+        """Noise variance at each step (array of length total_steps)."""
+        return self._betas
 
-    def get_alpha(self, t):
-        """Return alpha at step t (0-indexed)."""
-        return self.alphas[t]
+    @property
+    def alphas(self):
+        """1 - beta at each step."""
+        return self._alphas
 
-    def get_beta(self, t):
-        """Return beta at step t (0-indexed)."""
-        return self.betas[t]
+    @property
+    def alpha_cumprod(self):
+        """Cumulative product of alphas."""
+        return self._alpha_cumprod
 
-    def add_noise(self, x0, t, noise=None):
-        """Add noise according to forward diffusion process.
+    def get_noise_level(self, step):
+        """Return the noise level (variance) for a given step.
 
         Parameters
         ----------
-        x0 : np.ndarray
-            Clean data (e.g., spectrogram tile).
-        t : int
-            Diffusion step index (0..steps-1).
-        noise : np.ndarray, optional
-            Noise to add; if None, generated randomly.
+        step : int
+            Diffusion step index (0 to total_steps-1).
 
         Returns
         -------
-        np.ndarray
-            Noisy sample at step t.
+        float
+            Noise variance for that step.
         """
-        if noise is None:
-            noise = np.random.randn(*x0.shape).astype(np.float32)
-        alpha_bar = self.alpha_bars[t]
-        return np.sqrt(alpha_bar) * x0 + np.sqrt(1 - alpha_bar) * noise
+        if step < 0 or step >= self.total_steps:
+            raise IndexError(f"Step {step} out of range [0, {self.total_steps})")
+        return float(self._betas[step])
 
-    def __len__(self):
-        return self.steps
+    def get_signal_rate(self, step):
+        """Return the signal retention rate (sqrt of alpha_cumprod).
+
+        This is used for adding noise during the forward process: the signal
+        is scaled by sqrt(alpha_cumprod) and noise by sqrt(1 - alpha_cumprod).
+        """
+        return float(np.sqrt(self._alpha_cumprod[step]))
+
+    def add_noise(self, x, step, rng=None):
+        """Add noise to a clean signal according to the schedule.
+
+        This simulates the forward diffusion process. Given a clean tile x,
+        it returns a noisy version after `step` steps.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Clean signal (spectrogram tile).
+        step : int
+            Number of steps to forward diffuse (0 to total_steps-1).
+        rng : np.random.Generator, optional
+            Random generator for reproducibility.
+
+        Returns
+        -------
+        tuple of (noisy, noise)
+            The noisy signal and the added noise.
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+        alpha_cumprod = self._alpha_cumprod[step]
+        signal_scale = np.sqrt(alpha_cumprod)
+        noise_scale = np.sqrt(1 - alpha_cumprod)
+        noise = rng.normal(0.0, 1.0, size=x.shape).astype(np.float32)
+        noisy = signal_scale * x + noise_scale * noise
+        return noisy, noise
+
+    def get_timesteps(self):
+        """Return an array of step indices from most noise to least."""
+        return np.arange(self.total_steps - 1, -1, -1)
