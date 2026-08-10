@@ -1,166 +1,146 @@
 import numpy as np
 
 
-def normalize_spectrogram(tile, eps=1e-8):
-    """Normalize a spectrogram tile to have zero mean and unit variance.
+class SpectrumInverse:
+    """Inverse spectrogram transform to reconstruct audio from a magnitude spectrogram.
+
+    This module provides functionality to convert a 2D spectrogram (frequency-time)
+    back into a 1D audio signal. It uses the Griffin-Lim algorithm for phase
+    recovery, which iteratively estimates the phase that best matches the given
+    magnitude spectrogram. This is essential for playing back the generated
+    spectrogram tiles as audible audio.
 
     Parameters
     ----------
-    tile : np.ndarray
-        Input spectrogram tile.
-    eps : float
-        Small constant to avoid division by zero.
-
-    Returns
-    -------
-    (np.ndarray, tuple)
-        Normalized tile and a tuple (mean, std) for inverse normalization.
-    """
-    mean = np.mean(tile)
-    std = np.std(tile)
-    if std < eps:
-        std = 1.0
-    normalized = (tile - mean) / (std + eps)
-    return normalized, (mean, std)
-
-
-def denormalize_spectrogram(tile, stats):
-    """Apply the inverse of normalize_spectrogram.
-
-    Parameters
-    ----------
-    tile : np.ndarray
-        Normalized spectrogram tile.
-    stats : tuple
-        (mean, std) from normalize_spectrogram.
-
-    Returns
-    -------
-    np.ndarray
-        Denormalized tile.
-    """
-    mean, std = stats
-    return tile * std + mean
-
-
-def magnitude_to_audio(magnitude, phase=None, n_fft=512, hop_length=128):
-    """Convert a magnitude spectrogram to audio using the Griffin-Lim algorithm.
-
-    Parameters
-    ----------
-    magnitude : np.ndarray
-        Magnitude spectrogram (shape: (freq_bins, time_frames)).
-    phase : np.ndarray, optional
-        Initial phase estimate. If None, use random phase.
-    n_fft : int
-        FFT size.
+    fft_size : int
+        FFT size used for the spectrogram (must be even).
     hop_length : int
-        Hop length between frames.
-
-    Returns
-    -------
-    np.ndarray
-        1D audio array.
+        Hop length in samples between time frames.
+    sample_rate : int
+        Sample rate of the audio (used for potential resampling).
     """
-    if magnitude.ndim != 2:
-        raise ValueError("Magnitude must be 2D")
-    n_freq = magnitude.shape[0]
-    # Ensure frequency bins match n_fft//2+1
-    if n_freq != n_fft // 2 + 1:
-        # Interpolate to match
-        from scipy.interpolate import interp1d
-        x_old = np.linspace(0, 1, n_freq)
-        x_new = np.linspace(0, 1, n_fft // 2 + 1)
-        magnitude = interp1d(x_old, magnitude, axis=0, kind='linear')(x_new)
 
-    n_frames = magnitude.shape[1]
-    if phase is None:
-        rng = np.random.default_rng(0)
-        phase = rng.uniform(0, 2 * np.pi, (n_fft // 2 + 1, n_frames))
+    def __init__(self, fft_size=1024, hop_length=256, sample_rate=22050):
+        if fft_size % 2 != 0:
+            raise ValueError("fft_size must be even")
+        self.fft_size = fft_size
+        self.hop_length = hop_length
+        self.sample_rate = sample_rate
+        self.freq_bins = fft_size // 2 + 1
 
-    # Griffin-Lim iterations
-    audio = None
-    for _ in range(30):
-        # Reconstruct complex spectrum
-        complex_spec = magnitude * np.exp(1j * phase)
-        # Inverse STFT
-        audio = istft(complex_spec, hop_length=hop_length, n_fft=n_fft)
-        # Forward STFT to get new phase
-        new_spec = stft(audio, hop_length=hop_length, n_fft=n_fft)
-        phase = np.angle(new_spec)
+    def _stft(self, audio):
+        """Compute short-time Fourier transform of audio.
 
-    return audio
+        Parameters
+        ----------
+        audio : np.ndarray
+            1D float array of audio samples.
 
+        Returns
+        -------
+        np.ndarray
+            Complex STFT of shape (freq_bins, n_frames).
+        """
+        n_frames = 1 + (len(audio) - self.fft_size) // self.hop_length
+        if n_frames <= 0:
+            return np.zeros((self.freq_bins, 1), dtype=np.complex64)
+        stft = np.zeros((self.freq_bins, n_frames), dtype=np.complex64)
+        window = np.hanning(self.fft_size).astype(np.float32)
+        for i in range(n_frames):
+            start = i * self.hop_length
+            frame = audio[start:start + self.fft_size] * window
+            stft[:, i] = np.fft.rfft(frame)
+        return stft
 
-def stft(signal, n_fft=512, hop_length=128):
-    """Compute STFT of a 1D signal.
+    def _istft(self, stft, length=None):
+        """Compute inverse STFT from complex spectrogram.
 
-    Parameters
-    ----------
-    signal : np.ndarray
-        1D audio signal.
-    n_fft : int
-        FFT size.
-    hop_length : int
-        Hop length.
+        Parameters
+        ----------
+        stft : np.ndarray
+            Complex STFT of shape (freq_bins, n_frames).
+        length : int, optional
+            Desired output length. If None, inferred from frames.
 
-    Returns
-    -------
-    np.ndarray
-        Complex STFT of shape (n_fft//2+1, n_frames).
-    """
-    if signal.ndim != 1:
-        raise ValueError("Signal must be 1D")
-    n_samples = len(signal)
-    # Pad to ensure at least one frame
-    if n_samples < n_fft:
-        signal = np.pad(signal, (0, n_fft - n_samples))
-    n_frames = 1 + (len(signal) - n_fft) // hop_length
-    # Ensure enough length for n_frames
-    if len(signal) < (n_frames - 1) * hop_length + n_fft:
-        pad_len = (n_frames - 1) * hop_length + n_fft - len(signal)
-        signal = np.pad(signal, (0, pad_len))
-    windows = np.lib.stride_tricks.sliding_window_view(signal, n_fft)[::hop_length]
-    # Apply Hann window
-    window = np.hanning(n_fft)
-    windows = windows * window
-    spectrum = np.fft.rfft(windows, n=n_fft, axis=1)
-    return spectrum.T
+        Returns
+        -------
+        np.ndarray
+            1D float array of reconstructed audio.
+        """
+        n_frames = stft.shape[1]
+        if length is None:
+            length = (n_frames - 1) * self.hop_length + self.fft_size
+        audio = np.zeros(length, dtype=np.float32)
+        window = np.hanning(self.fft_size).astype(np.float32)
+        window_sum = np.zeros(length, dtype=np.float32)
+        for i in range(n_frames):
+            start = i * self.hop_length
+            frame = np.fft.irfft(stft[:, i], n=self.fft_size)
+            end = min(start + self.fft_size, length)
+            actual_len = end - start
+            if actual_len < self.fft_size:
+                frame = frame[:actual_len]
+                win = window[:actual_len]
+            else:
+                win = window
+            audio[start:end] += frame * win
+            window_sum[start:end] += win * win
+        # Normalize by window overlap-sum to avoid amplitude modulation
+        nonzero = window_sum > 1e-8
+        audio[nonzero] /= window_sum[nonzero]
+        return audio
 
+    def griffin_lim(self, magnitude, iterations=30, phase=None, length=None):
+        """Reconstruct audio from a magnitude spectrogram using Griffin-Lim.
 
-def istft(spectrum, hop_length=128, n_fft=512):
-    """Compute inverse STFT.
+        Parameters
+        ----------
+        magnitude : np.ndarray
+            2D float array of shape (freq_bins, n_frames) with non-negative values.
+        iterations : int, optional
+            Number of iterations for phase recovery.
+        phase : np.ndarray, optional
+            Initial complex phase estimate of shape (freq_bins, n_frames).
+            If None, starts with random phase.
+        length : int, optional
+            Desired output length. If None, inferred from frames.
 
-    Parameters
-    ----------
-    spectrum : np.ndarray
-        Complex STFT of shape (n_fft//2+1, n_frames).
-    hop_length : int
-        Hop length.
-    n_fft : int
-        FFT size.
+        Returns
+        -------
+        np.ndarray
+            1D float array of reconstructed audio.
+        """
+        if magnitude.shape[0] != self.freq_bins:
+            raise ValueError(f"Expected {self.freq_bins} frequency bins, got {magnitude.shape[0]}")
+        n_frames = magnitude.shape[1]
+        if length is None:
+            length = (n_frames - 1) * self.hop_length + self.fft_size
 
-    Returns
-    -------
-    np.ndarray
-        1D audio signal.
-    """
-    if spectrum.ndim != 2:
-        raise ValueError("Spectrum must be 2D")
-    n_freq, n_frames = spectrum.shape
-    if n_freq != n_fft // 2 + 1:
-        raise ValueError(f"Expected {n_fft//2+1} frequency bins, got {n_freq}")
-    window = np.hanning(n_fft)
-    signal_len = (n_frames - 1) * hop_length + n_fft
-    signal = np.zeros(signal_len)
-    window_sum = np.zeros(signal_len)
-    for i in range(n_frames):
-        start = i * hop_length
-        end = start + n_fft
-        frame = np.fft.irfft(spectrum[:, i], n=n_fft)
-        signal[start:end] += frame * window
-        window_sum[start:end] += window * window
-    # Normalize by window overlap
-    nonzero = window_sum > 1e-8
-    signal[nonzero] /= window_sum[nonzero]
-    return signal
+        # Initialize phase
+        if phase is None:
+            rng = np.random.default_rng(0)
+            phase = np.exp(2j * np.pi * rng.random(magnitude.shape)).astype(np.complex64)
+        else:
+            if phase.shape != magnitude.shape:
+                raise ValueError("phase shape must match magnitude shape")
+            phase = phase.astype(np.complex64)
+
+        # Iterative phase recovery
+        for _ in range(iterations):
+            # Combine magnitude with current phase
+            stft = magnitude * phase
+            # Inverse STFT to time domain
+            audio = self._istft(stft, length=length)
+            # Forward STFT to get new phase
+            new_stft = self._stft(audio)
+            # Update phase to match new STFT's phase, keep magnitude
+            phase = np.exp(1j * np.angle(new_stft)).astype(np.complex64)
+
+        # Final reconstruction
+        stft = magnitude * phase
+        audio = self._istft(stft, length=length)
+        return audio
+
+    def reconstruct(self, magnitude, iterations=30, phase=None, length=None):
+        """Alias for griffin_lim for convenience."""
+        return self.griffin_lim(magnitude, iterations=iterations, phase=phase, length=length)
