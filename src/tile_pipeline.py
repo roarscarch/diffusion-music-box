@@ -1,132 +1,133 @@
 import numpy as np
-from src.spectrogram import compute_spectrogram, spectrogram_to_audio
-from src.spectrum_inverse import invert_spectrogram
-from src.normalization import normalize_spectrogram, denormalize_spectrogram
-from src.overlap_add import overlap_add
-from src.augmentation import SpectrogramAugmenter
 
 
 class TilePipeline:
-    """Orchestrates the generation of a seamless audio segment from a spectrogram tile.
+    """Process spectrogram tiles for the diffusion music box.
 
-    This pipeline ties together the core modules: it takes a raw spectrogram tile
-    (or generates one from noise), normalizes it, applies optional augmentation,
-    converts it back to audio using the inverse transform, and finally applies
-    overlap-add crossfading to ensure smooth transitions between segments.
+    This pipeline applies a sequence of operations to a spectrogram tile,
+    such as normalization, spectral gating, contrast enhancement, and
+    denoising. It is designed to be extensible so that new processing steps
+    can be added easily. The pipeline is used to prepare tiles before
+    inverse transform to audio.
 
-    The pipeline is designed to be used in a loop to produce endless ambient music.
+    Parameters
+    ----------
+    steps : list of callables, optional
+        A list of processing functions. Each function should take a 2D
+        numpy array (freq x time) and return a processed 2D numpy array.
+        If None, a default set of steps is used.
+    normalize : bool, optional
+        Whether to normalize the tile to [-1, 1] after processing.
+        Default is True.
     """
 
-    def __init__(
-        self,
-        sample_rate=22050,
-        n_fft=1024,
-        hop_length=256,
-        freq_bins=128,
-        time_frames=128,
-        augmenter=None,
-    ):
-        self.sample_rate = sample_rate
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.freq_bins = freq_bins
-        self.time_frames = time_frames
-        self.augmenter = augmenter if augmenter is not None else SpectrogramAugmenter()
+    def __init__(self, steps=None, normalize=True):
+        self.steps = steps if steps is not None else self._default_steps()
+        self.normalize = normalize
 
-    def generate_audio_from_spectrogram(self, spectrogram):
-        """Convert a 2D spectrogram tile into audio samples.
+    def _default_steps(self):
+        """Return the default processing steps.
+
+        The default pipeline applies a soft clipping to reduce harsh peaks,
+        then a simple spectral gate to remove low-level noise, and finally
+        a mild contrast enhancement to bring out texture.
+        """
+        return [
+            self._soft_clip,
+            self._spectral_gate,
+            self._contrast_enhance,
+        ]
+
+    @staticmethod
+    def _soft_clip(tile, threshold=0.9):
+        """Apply soft clipping to limit extreme values.
+
+        Values above threshold are compressed using a tanh-like curve.
+        """
+        return np.tanh(tile / threshold) * threshold
+
+    @staticmethod
+    def _spectral_gate(tile, floor_db=-60):
+        """Gate low-level noise by zeroing values below a floor.
+
+        The floor is specified in dB relative to the maximum amplitude.
+        """
+        max_val = np.max(np.abs(tile))
+        if max_val == 0:
+            return tile
+        threshold = max_val * (10 ** (floor_db / 20))
+        return np.where(np.abs(tile) < threshold, 0, tile)
+
+    @staticmethod
+    def _contrast_enhance(tile, factor=1.2):
+        """Enhance contrast by scaling the deviation from the mean.
+
+        This makes quiet parts quieter and loud parts louder, increasing
+        the dynamic range.
+        """
+        mean = np.mean(tile)
+        return (tile - mean) * factor + mean
+
+    def process(self, tile):
+        """Run the tile through the pipeline.
 
         Parameters
         ----------
-        spectrogram : np.ndarray
-            2D array of shape (freq_bins, time_frames) representing magnitude
-            spectrogram (or log-magnitude).
+        tile : np.ndarray
+            2D float array of shape (freq_bins, time_steps).
 
         Returns
         -------
         np.ndarray
-            1D audio samples as float32.
+            Processed tile, normalized to [-1, 1] if ``normalize`` is True.
         """
-        # Ensure spectrogram is 2D and has expected shape
-        if spectrogram.ndim != 2:
-            raise ValueError("Spectrogram must be 2D")
-        if spectrogram.shape[0] != self.freq_bins or spectrogram.shape[1] != self.time_frames:
-            raise ValueError(
-                f"Spectrogram shape {spectrogram.shape} does not match expected ({self.freq_bins}, {self.time_frames})"
-            )
+        result = np.asarray(tile, dtype=np.float32)
+        if result.ndim != 2:
+            raise ValueError("Tile must be 2D (freq x time)")
 
-        # Apply augmentation for variety (e.g., time/freq shift, scale)
-        augmented = self.augmenter.random_time_shift(spectrogram)
-        augmented = self.augmenter.random_freq_shift(augmented)
-        augmented = self.augmenter.random_scale(augmented)
+        for step in self.steps:
+            result = step(result)
 
-        # Convert magnitude spectrogram to audio using inverse STFT
-        # This assumes the spectrogram is magnitude (not complex)
-        audio = invert_spectrogram(
-            augmented,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            sample_rate=self.sample_rate,
-        )
+        if self.normalize:
+            max_val = np.max(np.abs(result))
+            if max_val > 0:
+                result = result / max_val
 
-        # Normalize audio to avoid clipping
-        peak = np.max(np.abs(audio)) if len(audio) > 0 else 0.0
-        if peak > 0:
-            audio = audio / peak * 0.9
+        return result
 
-        return audio.astype(np.float32)
-
-    def generate_segment_from_noise(self, denoiser, steps=20, noise_schedule=None):
-        """Generate a new audio segment by denoising a random noise tile.
-
-        This method runs the diffusion process: starting from random noise,
-        iteratively apply the denoiser to produce a clean spectrogram tile,
-        then convert to audio.
+    def add_step(self, func, index=None):
+        """Add a new processing step to the pipeline.
 
         Parameters
         ----------
-        denoiser : object
-            A denoiser object with a `denoise` method that accepts a noisy
-            spectrogram and a noise level, returning a denoised version.
-        steps : int, optional
-            Number of diffusion steps to run.
-        noise_schedule : object, optional
-            Object with `get_noise_level(step, total_steps)` method.
-
-        Returns
-        -------
-        np.ndarray
-            1D audio samples.
+        func : callable
+            A function that takes a 2D numpy array and returns a processed
+            2D numpy array.
+        index : int, optional
+            Position at which to insert the step. If None, append to the end.
         """
-        rng = np.random.default_rng()
-        # Start with random noise in spectrogram domain
-        spectrogram = rng.standard_normal((self.freq_bins, self.time_frames)).astype(np.float32)
+        if index is None:
+            self.steps.append(func)
+        else:
+            self.steps.insert(index, func)
 
-        if noise_schedule is None:
-            # Default: linear schedule from 1.0 to 0.0
-            def default_schedule(step, total):
-                return 1.0 - step / max(total - 1, 1)
-            noise_schedule = type("SimpleSchedule", (), {"get_noise_level": staticmethod(default_schedule)})()
-
-        for step in range(steps):
-            noise_level = noise_schedule.get_noise_level(step, steps)
-            spectrogram = denoiser.denoise(spectrogram, noise_level)
-
-        return self.generate_audio_from_spectrogram(spectrogram)
-
-    def seamless_loop(self, segments, crossfade_samples=256):
-        """Stitch audio segments together with crossfades to create a seamless loop.
+    def remove_step(self, func):
+        """Remove a processing step from the pipeline.
 
         Parameters
         ----------
-        segments : list of np.ndarray
-            List of 1D audio arrays to concatenate.
-        crossfade_samples : int
-            Number of samples for crossfade between consecutive segments.
-
-        Returns
-        -------
-        np.ndarray
-            Combined audio array.
+        func : callable
+            The function to remove. If not found, raises ValueError.
         """
-        return overlap_add(segments, crossfade_samples)
+        try:
+            self.steps.remove(func)
+        except ValueError:
+            raise ValueError("Step not found in pipeline") from None
+
+    def clear_steps(self):
+        """Remove all processing steps."""
+        self.steps = []
+
+    def __call__(self, tile):
+        """Convenience method to process a tile."""
+        return self.process(tile)
