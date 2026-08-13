@@ -1,91 +1,64 @@
 import numpy as np
 import threading
-import time
+from midi_clock import MidiClock
 
 
-class MIDIController:
-    """A simple MIDI-like controller interface for keyboard input.
+class MidiController:
+    """Handles MIDI-like keyboard input for interactive control.
 
-    This module provides a headless CLI-based controller that maps keyboard
-    presses to MIDI-like control messages. It allows interactive adjustment
-    of parameters such as diffusion steps, noise schedule, and tempo.
-    It runs in a background thread, listening for key presses and updating
-    internal state that can be polled by other modules.
+    This class listens for keyboard events and translates them into
+    parameter changes for the diffusion music box. It provides a
+    simple event queue and a polling interface for the main loop.
+
+    Parameters
+    ----------
+    clock : MidiClock
+        The clock instance used for timing and synchronization.
     """
 
-    def __init__(self, poll_interval=0.05):
-        """Initialize the controller.
-
-        Parameters
-        ----------
-        poll_interval : float
-            Seconds between key state polls. Lower values increase responsiveness.
-        """
-        self._poll_interval = poll_interval
-        self._running = False
-        self._thread = None
+    def __init__(self, clock=None):
+        self.clock = clock or MidiClock()
+        self._event_queue = []
         self._lock = threading.Lock()
-        self._key_states = {}
-        self._last_key = None
-        self._key_count = 0
-        self._callback = None
+        self._running = False
+        self._key_map = {
+            'a': 'toggle_play',
+            's': 'stop',
+            'd': 'next_preset',
+            'f': 'prev_preset',
+            'j': 'tempo_down',
+            'k': 'tempo_up',
+            'l': 'toggle_crossfade',
+            ';': 'toggle_arp',
+            'q': 'quit',
+        }
 
     def start(self):
-        """Start the keyboard listener thread."""
-        if self._running:
-            return
+        """Start listening for keyboard input."""
         self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread = threading.Thread(target=self._listen, daemon=True)
         self._thread.start()
 
     def stop(self):
-        """Stop the keyboard listener thread."""
+        """Stop listening for keyboard input."""
         self._running = False
-        if self._thread:
-            self._thread.join(timeout=1.0)
-            self._thread = None
 
-    def set_callback(self, callback):
-        """Set a callback for key press events.
+    def _listen(self):
+        """Internal loop reading characters from stdin."""
+        import sys
+        import tty
+        import termios
 
-        Parameters
-        ----------
-        callback : callable
-            Function called with a key name string on each press.
-        """
-        with self._lock:
-            self._callback = callback
-
-    def _run(self):
-        """Main loop for keyboard polling."""
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
         try:
-            import termios
-            import tty
-            import sys
-            fd = sys.stdin.fileno()
-            old_settings = termios.tcgetattr(fd)
-            tty.setcbreak(fd)
-        except (ImportError, AttributeError, termios.error):
-            # Fallback: no raw mode, just read lines
-            old_settings = None
-
-        try:
+            tty.setraw(fd)
             while self._running:
-                try:
-                    import sys
-                    import select
-                    if select.select([sys.stdin], [], [], 0)[0]:
-                        key = sys.stdin.read(1)
-                        if key:
-                            self._handle_key(key)
-                except (IOError, ValueError):
-                    pass
-                time.sleep(self._poll_interval)
+                ch = sys.stdin.read(1)
+                if ch:
+                    self._handle_key(ch)
         finally:
-            if old_settings is not None:
-                import termios
-                import sys
-                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     def _handle_key(self, key):
         """Process a single key press.
@@ -93,64 +66,36 @@ class MIDIController:
         Parameters
         ----------
         key : str
-            The character pressed.
+            The character read from stdin.
         """
-        with self._lock:
-            self._key_states[key] = time.time()
-            self._last_key = key
-            self._key_count += 1
-            callback = self._callback
-        if callback:
-            callback(key)
+        action = self._key_map.get(key.lower())
+        if action:
+            with self._lock:
+                self._event_queue.append((action, self.clock.get_time()))
 
-    def get_key_state(self, key):
-        """Return the timestamp of the last press of a key.
-
-        Parameters
-        ----------
-        key : str
-            The key to query.
+    def poll_events(self):
+        """Retrieve and clear pending events.
 
         Returns
         -------
-        float or None
-            Time of last press, or None if never pressed.
+        list of tuple
+            Each tuple is (action, timestamp).
         """
         with self._lock:
-            return self._key_states.get(key)
+            events = list(self._event_queue)
+            self._event_queue.clear()
+            return events
 
-    def get_last_key(self):
-        """Return the most recently pressed key.
+    def get_state(self):
+        """Return current controller state for integration.
 
         Returns
         -------
-        str or None
-            The last key pressed, or None if none yet.
+        dict
+            A snapshot of relevant state.
         """
-        with self._lock:
-            return self._last_key
-
-    def get_key_count(self):
-        """Return the total number of key presses registered.
-
-        Returns
-        -------
-        int
-            Total key press count.
-        """
-        with self._lock:
-            return self._key_count
-
-    def clear(self):
-        """Reset key state and count."""
-        with self._lock:
-            self._key_states.clear()
-            self._last_key = None
-            self._key_count = 0
-
-    def __enter__(self):
-        self.start()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.stop()
+        return {
+            'running': self._running,
+            'key_map': dict(self._key_map),
+            'clock_time': self.clock.get_time(),
+        }
