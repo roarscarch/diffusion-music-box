@@ -1,133 +1,135 @@
 import numpy as np
+from .denoiser import Denoiser
+from .diffusion_model import DiffusionModel
+from .crossfade_mixer import CrossfadeMixer
+from .overlap_add import OverlapAdd
+from .noise_schedule import NoiseSchedule
 
 
 class TilePipeline:
-    """Process spectrogram tiles for the diffusion music box.
+    """Orchestrates the generation of audio from spectrogram tiles.
 
-    This pipeline applies a sequence of operations to a spectrogram tile,
-    such as normalization, spectral gating, contrast enhancement, and
-    denoising. It is designed to be extensible so that new processing steps
-    can be added easily. The pipeline is used to prepare tiles before
-    inverse transform to audio.
+    This pipeline ties together the diffusion model, denoiser, crossfade
+    mixer, and overlap-add to produce seamless, evolving ambient audio.
+    It generates a sequence of spectrogram tiles using the diffusion model,
+    converts them to audio, and blends them with crossfade to avoid clicks.
+    The pipeline is designed for real-time use, generating tiles on demand.
 
     Parameters
     ----------
-    steps : list of callables, optional
-        A list of processing functions. Each function should take a 2D
-        numpy array (freq x time) and return a processed 2D numpy array.
-        If None, a default set of steps is used.
-    normalize : bool, optional
-        Whether to normalize the tile to [-1, 1] after processing.
-        Default is True.
+    sample_rate : int
+        Sample rate of the audio.
+    fft_size : int
+        FFT size for the spectrogram.
+    hop_length : int
+        Hop length between frames.
+    diffusion_steps : int
+        Number of diffusion steps to run per tile.
+    noise_schedule : NoiseSchedule or None
+        Schedule for noise levels during diffusion.
+    crossfade_samples : int
+        Number of samples to crossfade between tiles.
     """
 
-    def __init__(self, steps=None, normalize=True):
-        self.steps = steps if steps is not None else self._default_steps()
-        self.normalize = normalize
+    def __init__(self, sample_rate=22050, fft_size=1024, hop_length=256,
+                 diffusion_steps=50, noise_schedule=None, crossfade_samples=256):
+        self.sample_rate = sample_rate
+        self.fft_size = fft_size
+        self.hop_length = hop_length
+        self.diffusion_steps = diffusion_steps
+        self.crossfade_samples = crossfade_samples
 
-    def _default_steps(self):
-        """Return the default processing steps.
+        self.noise_schedule = noise_schedule or NoiseSchedule('linear')
+        self.denoiser = Denoiser(fft_size=fft_size)
+        self.diffusion_model = DiffusionModel(
+            denoiser=self.denoiser,
+            noise_schedule=self.noise_schedule,
+            sample_rate=sample_rate,
+            fft_size=fft_size,
+            hop_length=hop_length
+        )
+        self.crossfade_mixer = CrossfadeMixer(crossfade_samples=crossfade_samples)
+        self.overlap_add = OverlapAdd(hop_length=hop_length)
 
-        The default pipeline applies a soft clipping to reduce harsh peaks,
-        then a simple spectral gate to remove low-level noise, and finally
-        a mild contrast enhancement to bring out texture.
-        """
-        return [
-            self._soft_clip,
-            self._spectral_gate,
-            self._contrast_enhance,
-        ]
-
-    @staticmethod
-    def _soft_clip(tile, threshold=0.9):
-        """Apply soft clipping to limit extreme values.
-
-        Values above threshold are compressed using a tanh-like curve.
-        """
-        return np.tanh(tile / threshold) * threshold
-
-    @staticmethod
-    def _spectral_gate(tile, floor_db=-60):
-        """Gate low-level noise by zeroing values below a floor.
-
-        The floor is specified in dB relative to the maximum amplitude.
-        """
-        max_val = np.max(np.abs(tile))
-        if max_val == 0:
-            return tile
-        threshold = max_val * (10 ** (floor_db / 20))
-        return np.where(np.abs(tile) < threshold, 0, tile)
-
-    @staticmethod
-    def _contrast_enhance(tile, factor=1.2):
-        """Enhance contrast by scaling the deviation from the mean.
-
-        This makes quiet parts quieter and loud parts louder, increasing
-        the dynamic range.
-        """
-        mean = np.mean(tile)
-        return (tile - mean) * factor + mean
-
-    def process(self, tile):
-        """Run the tile through the pipeline.
+    def generate_tile(self, seed=None):
+        """Generate a single spectrogram tile using the diffusion model.
 
         Parameters
         ----------
-        tile : np.ndarray
-            2D float array of shape (freq_bins, time_steps).
+        seed : int, optional
+            Random seed for reproducibility.
 
         Returns
         -------
         np.ndarray
-            Processed tile, normalized to [-1, 1] if ``normalize`` is True.
+            2D float array of shape (freq_bins, time_steps) representing the
+            spectrogram tile.
         """
-        result = np.asarray(tile, dtype=np.float32)
-        if result.ndim != 2:
-            raise ValueError("Tile must be 2D (freq x time)")
+        return self.diffusion_model.generate(seed=seed)
 
-        for step in self.steps:
-            result = step(result)
-
-        if self.normalize:
-            max_val = np.max(np.abs(result))
-            if max_val > 0:
-                result = result / max_val
-
-        return result
-
-    def add_step(self, func, index=None):
-        """Add a new processing step to the pipeline.
+    def tile_to_audio(self, tile):
+        """Convert a spectrogram tile to audio using inverse STFT.
 
         Parameters
         ----------
-        func : callable
-            A function that takes a 2D numpy array and returns a processed
-            2D numpy array.
-        index : int, optional
-            Position at which to insert the step. If None, append to the end.
-        """
-        if index is None:
-            self.steps.append(func)
-        else:
-            self.steps.insert(index, func)
+        tile : np.ndarray
+            2D spectrogram tile of shape (freq_bins, time_steps).
 
-    def remove_step(self, func):
-        """Remove a processing step from the pipeline.
+        Returns
+        -------
+        np.ndarray
+            1D float array of audio samples.
+        """
+        # Use the diffusion model's inverse transform (spectrum_inverse)
+        return self.diffusion_model.spectrum_inverse(tile)
+
+    def process(self, num_tiles=1, seed=None):
+        """Generate a sequence of audio segments and blend them.
 
         Parameters
         ----------
-        func : callable
-            The function to remove. If not found, raises ValueError.
+        num_tiles : int
+            Number of tiles to generate.
+        seed : int, optional
+            Base seed for reproducibility; each tile uses seed + index.
+
+        Returns
+        -------
+        np.ndarray
+            Concatenated audio with crossfade applied between segments.
         """
-        try:
-            self.steps.remove(func)
-        except ValueError:
-            raise ValueError("Step not found in pipeline") from None
+        audio_segments = []
+        for i in range(num_tiles):
+            tile = self.generate_tile(seed=(seed + i) if seed is not None else None)
+            audio = self.tile_to_audio(tile)
+            audio_segments.append(audio)
 
-    def clear_steps(self):
-        """Remove all processing steps."""
-        self.steps = []
+        if not audio_segments:
+            return np.zeros(0, dtype=np.float32)
 
-    def __call__(self, tile):
-        """Convenience method to process a tile."""
-        return self.process(tile)
+        # Crossfade between consecutive segments
+        blended = audio_segments[0]
+        for next_seg in audio_segments[1:]:
+            blended = self.crossfade_mixer.crossfade(blended, next_seg)
+
+        return blended
+
+    def stream(self, num_tiles, seed=None):
+        """Yield audio segments one at a time for real-time playback.
+
+        Parameters
+        ----------
+        num_tiles : int
+            Number of tiles to generate.
+        seed : int, optional
+            Base seed for reproducibility.
+
+        Yields
+        ------
+        np.ndarray
+            Audio segment for each tile.
+        """
+        for i in range(num_tiles):
+            tile = self.generate_tile(seed=(seed + i) if seed is not None else None)
+            audio = self.tile_to_audio(tile)
+            yield audio
