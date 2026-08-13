@@ -2,175 +2,129 @@ import numpy as np
 
 
 class SpectrumInverse:
-    """Perform inverse spectrogram transform to reconstruct audio from magnitude/phase.
+    """Inverse transform from spectrogram tiles to audio waveform.
 
-    This module provides a real-time capable inverse transform that converts
-    a 2D spectrogram (frequency-time) back to a 1D audio signal. It supports
-    magnitude-only spectrograms using the Griffin-Lim algorithm, or complex
-    spectrograms when phase information is available. The implementation
-    uses overlap-add with a Hann window to ensure smooth reconstruction.
+    This module provides the inverse operation to the spectrogram analysis,
+    converting a 2D frequency-time representation back into a 1D audio
+    signal. It uses the inverse Short-Time Fourier Transform (ISTFT) with
+    overlap-add synthesis to reconstruct the time-domain waveform. The class
+    supports both magnitude-only spectrograms (using a random phase
+    initialization) and complex spectrograms.
 
     Parameters
     ----------
-    n_fft : int
-        FFT size (number of frequency bins = n_fft // 2 + 1).
+    fft_size : int
+        FFT size used during analysis.
     hop_length : int
-        Hop length in samples between time frames.
-    window : str, optional
-        Window function name ('hann', 'hamming', 'blackman'). Default 'hann'.
+        Hop length in samples between frames.
+    window : str or np.ndarray, optional
+        Window type to apply during synthesis. Can be a string ('hann',
+        'hamming', 'blackman', etc.) or a precomputed window array. Defaults
+        to 'hann'.
     """
 
-    def __init__(self, n_fft=1024, hop_length=256, window='hann'):
-        self.n_fft = n_fft
+    def __init__(self, fft_size=1024, hop_length=256, window='hann'):
+        self.fft_size = fft_size
         self.hop_length = hop_length
-        self.window_name = window
-        self.freq_bins = n_fft // 2 + 1
-        self._window = self._get_window(window)
+        self.freq_bins = fft_size // 2 + 1
+        self.window = self._create_window(window)
 
-    def _get_window(self, name):
-        """Return the window function array of length n_fft."""
-        if name == 'hann':
-            return np.hanning(self.n_fft)
-        elif name == 'hamming':
-            return np.hamming(self.n_fft)
-        elif name == 'blackman':
-            return np.blackman(self.n_fft)
-        else:
-            raise ValueError(f"Unknown window: {name}")
-
-    def _istft(self, spectrogram, phase=None, iterations=32):
-        """Inverse STFT using Griffin-Lim if phase is None.
+    def _create_window(self, window):
+        """Create a synthesis window array.
 
         Parameters
         ----------
-        spectrogram : np.ndarray
-            2D array of shape (freq_bins, time_frames) containing magnitudes.
-        phase : np.ndarray, optional
-            2D array of same shape containing phase angles in radians.
-            If None, Griffin-Lim algorithm is used.
-        iterations : int
-            Number of Griffin-Lim iterations. Ignored if phase is provided.
+        window : str or np.ndarray
+            Either a window name or a precomputed array.
 
         Returns
         -------
         np.ndarray
-            1D audio signal.
+            Window of length fft_size.
         """
-        if spectrogram.ndim != 2:
-            raise ValueError("Spectrogram must be 2D")
-        if spectrogram.shape[0] != self.freq_bins:
-            raise ValueError(f"Spectrogram frequency bins {spectrogram.shape[0]} != expected {self.freq_bins}")
-
-        n_frames = spectrogram.shape[1]
-        if phase is None:
-            # Initialize phase randomly
-            rng = np.random.default_rng(0)
-            phase = rng.uniform(-np.pi, np.pi, size=spectrogram.shape)
-            signal = self._griffin_lim(spectrogram, phase, iterations)
+        if isinstance(window, str):
+            if window == 'hann':
+                return np.hanning(self.fft_size)
+            elif window == 'hamming':
+                return np.hamming(self.fft_size)
+            elif window == 'blackman':
+                return np.blackman(self.fft_size)
+            else:
+                raise ValueError(f"Unknown window type: {window}")
         else:
-            if phase.shape != spectrogram.shape:
-                raise ValueError("Phase must have same shape as spectrogram")
-            signal = self._istft_with_phase(spectrogram, phase)
-        return signal
+            arr = np.asarray(window)
+            if arr.ndim != 1 or len(arr) != self.fft_size:
+                raise ValueError(f"Window must be 1D of length {self.fft_size}")
+            return arr.astype(np.float32)
 
-    def _griffin_lim(self, magnitudes, initial_phase, iterations):
-        """Griffin-Lim iterative phase reconstruction."""
-        phase = initial_phase.copy()
-        for _ in range(iterations):
-            # Reconstruct signal with current phase
-            complex_spec = magnitudes * np.exp(1j * phase)
-            signal = self._istft_with_phase(complex_spec, None, use_complex=True)
-            # Re-analyze to get new phase
-            _, new_phase = self._stft(signal, return_phase=True)
-            phase = new_phase
-        # Final reconstruction
-        complex_spec = magnitudes * np.exp(1j * phase)
-        return self._istft_with_phase(complex_spec, None, use_complex=True)
-
-    def _stft(self, signal, return_phase=False):
-        """Forward STFT to analyze signal (used in Griffin-Lim).
-
-        Returns magnitudes and optionally phases.
-        """
-        n_samples = len(signal)
-        pad_len = self.n_fft - self.hop_length
-        signal_padded = np.pad(signal, (pad_len // 2, pad_len // 2 + pad_len % 2), mode='reflect')
-        n_frames = 1 + (len(signal_padded) - self.n_fft) // self.hop_length
-        frames = np.zeros((n_frames, self.n_fft), dtype=np.float32)
-        for i in range(n_frames):
-            start = i * self.hop_length
-            frames[i] = signal_padded[start:start + self.n_fft] * self._window
-        spec = np.fft.rfft(frames, axis=1)
-        magnitudes = np.abs(spec)
-        if return_phase:
-            phases = np.angle(spec)
-            return magnitudes.T, phases.T
-        return magnitudes.T
-
-    def _istft_with_phase(self, spectrogram, phase=None, use_complex=False):
-        """Inverse STFT given magnitude and phase or complex spectrogram.
+    def _istft(self, stft_matrix, phase=None):
+        """Perform inverse STFT on a complex or magnitude spectrogram.
 
         Parameters
         ----------
-        spectrogram : np.ndarray
-            Magnitude (if phase given) or complex (if use_complex=True).
+        stft_matrix : np.ndarray
+            Complex STFT matrix of shape (freq_bins, time_frames). If the
+            matrix is real (magnitude), a random phase is used.
         phase : np.ndarray, optional
-            Phase angles if spectrogram is magnitude.
-        use_complex : bool
-            If True, spectrogram is already complex.
+            Phase matrix of the same shape as stft_matrix. If not provided
+            and stft_matrix is real, random phase is generated.
 
         Returns
         -------
         np.ndarray
-            Reconstructed audio signal.
+            1D float audio signal.
         """
-        if use_complex:
-            complex_spec = spectrogram
+        if stft_matrix.ndim != 2:
+            raise ValueError("STFT matrix must be 2D")
+        if stft_matrix.shape[0] != self.freq_bins:
+            raise ValueError(f"Expected {self.freq_bins} frequency bins, got {stft_matrix.shape[0]}")
+
+        if np.iscomplexobj(stft_matrix):
+            # Use provided complex matrix directly
+            complex_stft = stft_matrix.astype(np.complex64)
         else:
+            # Magnitude spectrogram: use given phase or random
             if phase is None:
-                raise ValueError("Phase required when not use_complex")
-            complex_spec = spectrogram * np.exp(1j * phase)
+                rng = np.random.default_rng()
+                phase = rng.uniform(-np.pi, np.pi, size=stft_matrix.shape)
+            if phase.shape != stft_matrix.shape:
+                raise ValueError("Phase shape must match magnitude shape")
+            complex_stft = stft_matrix * np.exp(1j * phase)
 
-        # Inverse FFT
-        frames = np.fft.irfft(complex_spec.T, n=self.n_fft, axis=1)
-        # Apply window and overlap-add
-        n_frames = frames.shape[0]
-        output_len = (n_frames - 1) * self.hop_length + self.n_fft
-        output = np.zeros(output_len, dtype=np.float32)
-        window_sum = np.zeros(output_len, dtype=np.float32)
+        n_frames = complex_stft.shape[1]
+        expected_length = self.hop_length * (n_frames - 1) + self.fft_size
+        output = np.zeros(expected_length, dtype=np.float32)
+        window_sum = np.zeros(expected_length, dtype=np.float32)
 
         for i in range(n_frames):
             start = i * self.hop_length
-            output[start:start + self.n_fft] += frames[i] * self._window
-            window_sum[start:start + self.n_fft] += self._window ** 2
+            end = start + self.fft_size
+            frame = np.fft.irfft(complex_stft[:, i], n=self.fft_size)
+            frame = frame * self.window
+            output[start:end] += frame
+            window_sum[start:end] += self.window ** 2
 
-        # Normalize by window overlap
+        # Normalize by window sum to correct for overlap-add
         nonzero = window_sum > 1e-10
         output[nonzero] /= window_sum[nonzero]
 
-        # Trim to original length (assuming centered padding)
-        pad_len = self.n_fft // 2
-        if output_len > pad_len * 2:
-            output = output[pad_len:-pad_len]
-        else:
-            output = output[pad_len:]
-        return output
+        return output.astype(np.float32)
 
-    def forward(self, spectrogram, phase=None, iterations=32):
-        """Convert spectrogram to audio signal.
+    def reconstruct(self, spectrogram, phase=None):
+        """Reconstruct audio from a spectrogram tile.
 
         Parameters
         ----------
         spectrogram : np.ndarray
-            2D array of shape (freq_bins, time_frames) containing magnitudes.
+            2D array of shape (freq_bins, time_frames). Can be complex or
+            magnitude-only.
         phase : np.ndarray, optional
-            2D array of phase angles. If None, Griffin-Lim is used.
-        iterations : int, optional
-            Number of Griffin-Lim iterations if phase is None.
+            Phase matrix for magnitude-only spectrograms. If not given, a
+            random phase is generated.
 
         Returns
         -------
         np.ndarray
-            1D audio signal.
+            1D audio samples.
         """
-        return self._istft(spectrogram, phase, iterations)
+        return self._istft(spectrogram, phase)
