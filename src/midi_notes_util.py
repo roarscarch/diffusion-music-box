@@ -1,137 +1,121 @@
 import numpy as np
 
 
-class MidiNotesUtil:
-    """Utility class for converting between MIDI note numbers, frequencies, and note names.
+def midi_to_frequency(midi_note):
+    """Convert a MIDI note number to its frequency in Hz.
 
-    This module provides helpers for musical pitch conversions used throughout the
-    project, such as mapping MIDI notes to frequencies for the arpeggiator or
-    spectrogram frequency bins. It also includes a small lookup table for note names.
+    Parameters
+    ----------
+    midi_note : int or float
+        MIDI note number (e.g., 69 for A4).
+
+    Returns
+    -------
+    float
+        Frequency in Hz.
     """
+    return 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
 
-    # Standard note names for MIDI note numbers (C4 = 60, A4 = 69)
-    NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
-    @staticmethod
-    def note_to_freq(midi_note: int) -> float:
-        """Convert a MIDI note number to frequency in Hz.
+def frequency_to_midi(frequency):
+    """Convert a frequency in Hz to the nearest MIDI note number.
 
-        Parameters
-        ----------
-        midi_note : int
-            MIDI note number (0-127).
+    Parameters
+    ----------
+    frequency : float
+        Frequency in Hz.
 
-        Returns
-        -------
-        float
-            Frequency in Hz.
+    Returns
+    -------
+    int
+        MIDI note number.
+    """
+    return int(round(69 + 12 * np.log2(frequency / 440.0)))
 
-        Raises
-        ------
-        ValueError
-            If midi_note is outside the valid range [0, 127].
-        """
-        if not 0 <= midi_note <= 127:
-            raise ValueError(f"MIDI note must be in [0, 127], got {midi_note}")
-        return 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
 
-    @staticmethod
-    def freq_to_note(freq: float) -> int:
-        """Convert a frequency in Hz to the nearest MIDI note number.
+def midi_to_name(midi_note):
+    """Convert a MIDI note number to a human-readable note name.
 
-        Parameters
-        ----------
-        freq : float
-            Frequency in Hz. Must be positive.
+    Parameters
+    ----------
+    midi_note : int
+        MIDI note number.
 
-        Returns
-        -------
-        int
-            MIDI note number (0-127).
+    Returns
+    -------
+    str
+        Note name like 'C4', 'F#3'.
+    """
+    names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+    name = names[midi_note % 12]
+    octave = midi_note // 12 - 1
+    return f"{name}{octave}"
 
-        Raises
-        ------
-        ValueError
-            If freq is not positive.
-        """
-        if freq <= 0:
-            raise ValueError(f"Frequency must be positive, got {freq}")
-        midi = 69 + 12 * np.log2(freq / 440.0)
-        return int(round(midi))
 
-    @staticmethod
-    def note_to_name(midi_note: int) -> str:
-        """Convert a MIDI note number to its note name (e.g., 60 -> 'C4').
+def name_to_midi(note_name):
+    """Convert a note name to MIDI note number.
 
-        Parameters
-        ----------
-        midi_note : int
-            MIDI note number (0-127).
+    Parameters
+    ----------
+    note_name : str
+        Note name like 'C4', 'F#3'.
 
-        Returns
-        -------
-        str
-            Note name with octave number (e.g., 'C4').
+    Returns
+    -------
+    int
+        MIDI note number.
 
-        Raises
-        ------
-        ValueError
-            If midi_note is outside the valid range [0, 127].
-        """
-        if not 0 <= midi_note <= 127:
-            raise ValueError(f"MIDI note must be in [0, 127], got {midi_note}")
-        name = MidiNotesUtil.NOTE_NAMES[midi_note % 12]
-        octave = (midi_note // 12) - 1  # C4 = 60, so octave 4 for 60
-        return f"{name}{octave}"
+    Raises
+    ------
+    ValueError
+        If the note name is invalid.
+    """
+    names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+    note_name = note_name.strip()
+    if len(note_name) < 2:
+        raise ValueError(f"Invalid note name: {note_name}")
+    # Separate note part and octave part
+    if note_name[1] == '#':
+        note_part = note_name[:2]
+        octave_part = note_name[2:]
+    else:
+        note_part = note_name[:1]
+        octave_part = note_name[1:]
+    if note_part not in names:
+        raise ValueError(f"Invalid note name: {note_name}")
+    if not octave_part.isdigit():
+        raise ValueError(f"Invalid octave: {note_name}")
+    octave = int(octave_part)
+    return (octave + 1) * 12 + names.index(note_part)
 
-    @staticmethod
-    def freq_to_bin(freq: float, sample_rate: int, fft_size: int) -> int:
-        """Convert a frequency in Hz to the nearest FFT bin index.
 
-        Parameters
-        ----------
-        freq : float
-            Frequency in Hz.
-        sample_rate : int
-            Sample rate of the audio.
-        fft_size : int
-            FFT size.
+def midi_to_frequency_array(midi_notes):
+    """Convert an array of MIDI notes to frequencies.
 
-        Returns
-        -------
-        int
-            Bin index, clamped to the valid range.
+    Parameters
+    ----------
+    midi_notes : array-like
+        MIDI note numbers.
 
-        Raises
-        ------
-        ValueError
-            If sample_rate or fft_size are non-positive.
-        """
-        if sample_rate <= 0 or fft_size <= 0:
-            raise ValueError("sample_rate and fft_size must be positive")
-        bin_index = int(round(freq * fft_size / sample_rate))
-        max_bin = fft_size // 2
-        return max(0, min(bin_index, max_bin))
+    Returns
+    -------
+    np.ndarray
+        Frequencies in Hz.
+    """
+    return midi_to_frequency(np.asarray(midi_notes))
 
-    @staticmethod
-    def midi_to_freq_bin(midi_note: int, sample_rate: int, fft_size: int) -> int:
-        """Convert a MIDI note to the nearest FFT bin index.
 
-        Convenience wrapper combining note_to_freq and freq_to_bin.
+def frequency_to_midi_array(frequencies):
+    """Convert an array of frequencies to MIDI notes.
 
-        Parameters
-        ----------
-        midi_note : int
-            MIDI note number.
-        sample_rate : int
-            Sample rate of the audio.
-        fft_size : int
-            FFT size.
+    Parameters
+    ----------
+    frequencies : array-like
+        Frequencies in Hz.
 
-        Returns
-        -------
-        int
-            Bin index.
-        """
-        freq = MidiNotesUtil.note_to_freq(midi_note)
-        return MidiNotesUtil.freq_to_bin(freq, sample_rate, fft_size)
+    Returns
+    -------
+    np.ndarray
+        MIDI note numbers.
+    """
+    return frequency_to_midi(np.asarray(frequencies))
