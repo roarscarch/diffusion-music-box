@@ -1,33 +1,39 @@
-import numpy as np
 import threading
+import numpy as np
 
 
 class AudioSegmentQueue:
-    """A thread-safe queue for audio segments with crossfade support.
+    """A thread-safe queue for audio segments with optional overlap and crossfade.
 
-    This class manages a queue of audio segments that can be added from the
-    generation thread and consumed by the audio engine. It supports
-    concatenating segments with optional crossfading to ensure seamless
-    playback between segments. The queue is bounded to prevent unbounded
-    memory growth.
+    This class provides a FIFO queue for audio segments. It is designed to be
+    used by a producer (e.g., a real-time generator) and a consumer (e.g.,
+    an audio engine). The queue supports adding segments and retrieving them
+    in order, with optional overlap and crossfade blending between consecutive
+    segments to ensure smooth transitions.
+
+    The queue is bounded to prevent unbounded memory growth. When full, the
+    oldest segment is dropped to make room for new ones.
 
     Parameters
     ----------
     max_segments : int
         Maximum number of segments to store in the queue.
-    crossfade_samples : int, optional
-        Number of samples over which to crossfade between adjacent segments.
-        If zero, segments are concatenated without crossfading.
+    overlap_samples : int
+        Number of samples that consecutive segments should overlap. When
+        retrieving a segment, the overlap region is blended with the next
+        segment using a linear crossfade.
     """
 
-    def __init__(self, max_segments=16, crossfade_samples=0):
+    def __init__(self, max_segments=16, overlap_samples=0):
         self._segments = []
-        self._lock = threading.Lock()
+        self._lock = threading.Condition()
         self._max_segments = max_segments
-        self._crossfade_samples = crossfade_samples
+        self._overlap = int(overlap_samples)
+        if self._overlap < 0:
+            raise ValueError("overlap_samples must be non-negative")
 
-    def add(self, segment):
-        """Add an audio segment to the queue.
+    def put(self, segment):
+        """Add a segment to the queue.
 
         Parameters
         ----------
@@ -47,106 +53,76 @@ class AudioSegmentQueue:
             if len(self._segments) > self._max_segments:
                 # Drop the oldest segment to prevent unbounded growth
                 self._segments.pop(0)
+            self._lock.notify()
 
-    def pop(self):
-        """Remove and return the oldest segment from the queue.
+    def get(self, block=True, timeout=None):
+        """Get the next segment from the queue, optionally with crossfade.
+
+        When there is at least one segment available, the first segment is
+        returned. If there is a next segment and overlap_samples > 0, the
+        overlapping tail of the first segment is crossfaded with the head of
+        the next segment, and the next segment is trimmed accordingly.
+
+        Parameters
+        ----------
+        block : bool
+            If True, block until a segment is available. If False, return
+            None immediately if the queue is empty.
+        timeout : float or None
+            Maximum time to block in seconds. Only used if block is True.
 
         Returns
         -------
         np.ndarray or None
-            The oldest segment as a 1D float array, or None if the queue is empty.
+            The next audio segment as a 1D float array, or None if no segment
+            is available (when block=False or timeout expires).
         """
         with self._lock:
-            if not self._segments:
-                return None
-            return self._segments.pop(0)
+            if not block:
+                if not self._segments:
+                    return None
+            else:
+                if not self._segments:
+                    self._lock.wait(timeout)
+                if not self._segments:
+                    return None
 
-    def peek(self):
-        """Return the oldest segment without removing it.
+            seg = self._segments.pop(0)
 
-        Returns
-        -------
-        np.ndarray or None
-            The oldest segment as a 1D float array, or None if the queue is empty.
-        """
+            # If overlap is enabled and there is a next segment, blend them
+            if self._overlap > 0 and self._segments:
+                next_seg = self._segments[0]
+                if len(seg) >= self._overlap and len(next_seg) >= self._overlap:
+                    # Crossfade the tail of seg with the head of next_seg
+                    fade_in = np.linspace(0.0, 1.0, self._overlap, dtype=np.float32)
+                    fade_out = 1.0 - fade_in
+                    tail = seg[-self._overlap:] * fade_out
+                    head = next_seg[:self._overlap] * fade_in
+                    blended = tail + head
+                    # Replace the overlap region in the next segment with the
+                    # blended version (this will be used later)
+                    next_seg = np.concatenate([
+                        blended,
+                        next_seg[self._overlap:]
+                    ])
+                    self._segments[0] = next_seg
+                    # Trim the returned segment to exclude the overlap region
+                    seg = seg[:-self._overlap]
+
+            return seg
+
+    def qsize(self):
+        """Return the current number of segments in the queue."""
         with self._lock:
-            if not self._segments:
-                return None
-            return self._segments[0]
+            return len(self._segments)
+
+    def empty(self):
+        """Return True if the queue is empty."""
+        with self._lock:
+            return len(self._segments) == 0
 
     def clear(self):
         """Remove all segments from the queue."""
         with self._lock:
             self._segments.clear()
-
-    def __len__(self):
-        """Return the number of segments currently in the queue."""
-        with self._lock:
-            return len(self._segments)
-
-    def is_empty(self):
-        """Return True if the queue is empty."""
-        with self._lock:
-            return len(self._segments) == 0
-
-    def get_all(self):
-        """Return a copy of all segments in the queue.
-
-        Returns
-        -------
-        list of np.ndarray
-            A list of all segments in the queue.
-        """
-        with self._lock:
-            return list(self._segments)
-
-    def concatenate_with_crossfade(self):
-        """Concatenate all segments in the queue into a single array.
-
-        If crossfade_samples is greater than zero, adjacent segments are
-        blended over the crossfade region. If the queue is empty, returns an
-        empty array. The queue is cleared after concatenation.
-
-        Returns
-        -------
-        np.ndarray
-            The concatenated audio samples as a 1D float array.
-        """
-        with self._lock:
-            if not self._segments:
-                return np.zeros(0, dtype=np.float32)
-            if len(self._segments) == 1:
-                result = self._segments[0].copy()
-            else:
-                # Concatenate with crossfade
-                fade_len = min(self._crossfade_samples, len(self._segments[0]), len(self._segments[-1]))
-                if fade_len <= 0:
-                    # No crossfade needed
-                    result = np.concatenate(self._segments)
-                else:
-                    # Build output array with room for crossfades
-                    total_len = sum(len(seg) for seg in self._segments) - fade_len * (len(self._segments) - 1)
-                    result = np.zeros(total_len, dtype=np.float32)
-                    pos = 0
-                    for i, seg in enumerate(self._segments):
-                        if i == 0:
-                            # First segment: copy whole
-                            result[:len(seg)] = seg
-                            pos = len(seg)
-                        else:
-                            # Crossfade with previous segment
-                            # Previous segment's tail is already in result at pos - len(prev_seg)
-                            prev_len = len(self._segments[i-1])
-                            # Overlap region length
-                            overlap = min(fade_len, prev_len, len(seg))
-                            # Apply crossfade to overlap
-                            fade_in = np.linspace(0.0, 1.0, overlap, dtype=np.float32)
-                            fade_out = 1.0 - fade_in
-                            # Add the fade-in of current segment to the tail of previous
-                            result[pos - overlap:pos] *= fade_out
-                            result[pos - overlap:pos] += seg[:overlap] * fade_in
-                            # Copy the rest of the current segment
-                            result[pos:pos + len(seg) - overlap] = seg[overlap:]
-                            pos += len(seg) - overlap
-            self._segments.clear()
-            return result
+            self._lock.notify_all()
