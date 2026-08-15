@@ -1,10 +1,12 @@
 import numpy as np
 
 
-def midi_to_freq(midi_note: int) -> float:
-    """Convert a MIDI note number to frequency in Hz.
+# MIDI note number to note name mapping (C, C#, D, ...)
+_NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
-    Uses the standard formula: 440 * 2^((midi - 69) / 12).
+
+def midi_to_freq(midi_note):
+    """Convert a MIDI note number to frequency in Hz.
 
     Parameters
     ----------
@@ -15,42 +17,30 @@ def midi_to_freq(midi_note: int) -> float:
     -------
     float
         Frequency in Hz.
-
-    Raises
-    ------
-    ValueError
-        If midi_note is outside the valid range.
     """
-    if not 0 <= midi_note <= 127:
-        raise ValueError(f"MIDI note must be between 0 and 127, got {midi_note}")
     return 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
 
 
-def freq_to_midi(freq: float) -> float:
-    """Convert a frequency in Hz to the nearest MIDI note number (float).
+def freq_to_midi(freq):
+    """Convert a frequency in Hz to the nearest MIDI note number.
 
     Parameters
     ----------
     freq : float
-        Frequency in Hz. Must be positive.
+        Frequency in Hz.
 
     Returns
     -------
-    float
-        MIDI note number as a float (not rounded).
-
-    Raises
-    ------
-    ValueError
-        If freq is not positive.
+    int
+        MIDI note number (0-127).
     """
     if freq <= 0:
-        raise ValueError(f"Frequency must be positive, got {freq}")
-    return 69 + 12 * np.log2(freq / 440.0)
+        return 0
+    return int(round(69 + 12 * np.log2(freq / 440.0)))
 
 
-def midi_to_name(midi_note: int) -> str:
-    """Return the note name (e.g., 'C4') for a MIDI note number.
+def midi_to_note_name(midi_note):
+    """Convert a MIDI note number to a note name string with octave.
 
     Parameters
     ----------
@@ -60,71 +50,86 @@ def midi_to_name(midi_note: int) -> str:
     Returns
     -------
     str
-        Note name with octave, e.g., 'C4' or 'F#3'.
-
-    Raises
-    ------
-    ValueError
-        If midi_note is outside the valid range.
+        Note name, e.g., 'C4', 'F#3'.
     """
-    if not 0 <= midi_note <= 127:
-        raise ValueError(f"MIDI note must be between 0 and 127, got {midi_note}")
-    note_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-    name = note_names[midi_note % 12]
+    if midi_note < 0 or midi_note > 127:
+        raise ValueError(f"MIDI note out of range: {midi_note}")
+    note_name = _NOTE_NAMES[midi_note % 12]
     octave = midi_note // 12 - 1
-    return f"{name}{octave}"
+    return f"{note_name}{octave}"
 
 
-def name_to_midi(name: str) -> int:
-    """Convert a note name (e.g., 'C4') to a MIDI note number.
-
-    Supports sharps (#) and flats (b). Octave is required.
+def note_name_to_midi(note_name):
+    """Convert a note name string (e.g., 'C4') to MIDI note number.
 
     Parameters
     ----------
-    name : str
-        Note name like 'C4', 'F#3', 'Bb2'.
+    note_name : str
+        Note name in format like 'C4', 'F#3', 'Bb2' (case-insensitive).
 
     Returns
     -------
     int
         MIDI note number.
-
-    Raises
-    ------
-    ValueError
-        If the name is invalid.
     """
-    name = name.strip()
-    if not name:
-        raise ValueError("Note name cannot be empty")
-
-    # Parse accidental
-    if len(name) >= 2 and name[1] in ('#', 'b'):
-        note_part = name[0:2]
-        octave_part = name[2:]
-    else:
-        note_part = name[0]
-        octave_part = name[1:]
-
-    note_names = {
-        'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3,
-        'E': 4, 'F': 5, 'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8,
-        'Ab': 8, 'A': 9, 'A#': 10, 'Bb': 10, 'B': 11
-    }
-
-    if note_part not in note_names:
-        raise ValueError(f"Unknown note: {note_part}")
-
-    if not octave_part:
-        raise ValueError("Octave is required (e.g., 'C4')")
-
+    note_name = note_name.strip().upper()
+    if not note_name:
+        raise ValueError("Empty note name")
+    # Find the letter part (C, D, E, F, G, A, B) and optional sharp/flat
+    letter = note_name[0]
+    if letter not in 'ABCDEFG':
+        raise ValueError(f"Invalid note letter: {letter}")
+    idx = 1
+    accidental = 0
+    if idx < len(note_name) and note_name[idx] == '#':
+        accidental = 1
+        idx += 1
+    elif idx < len(note_name) and note_name[idx] == 'B':
+        accidental = -1
+        idx += 1
+    # Parse octave (remaining characters)
+    if idx >= len(note_name):
+        raise ValueError(f"Missing octave in note name: {note_name}")
     try:
-        octave = int(octave_part)
+        octave = int(note_name[idx:])
     except ValueError:
-        raise ValueError(f"Invalid octave: {octave_part}")
+        raise ValueError(f"Invalid octave in note name: {note_name}")
+    # Map letter to base pitch class
+    base = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}[letter]
+    pitch_class = (base + accidental) % 12
+    midi_note = (octave + 1) * 12 + pitch_class
+    if midi_note < 0 or midi_note > 127:
+        raise ValueError(f"MIDI note out of range: {midi_note}")
+    return midi_note
 
-    midi = note_names[note_part] + (octave + 1) * 12
-    if not 0 <= midi <= 127:
-        raise ValueError(f"MIDI note out of range: {midi}")
-    return midi
+
+def midi_to_freq_array(midi_notes):
+    """Convert an array of MIDI notes to frequencies.
+
+    Parameters
+    ----------
+    midi_notes : array-like
+        Sequence of MIDI note numbers.
+
+    Returns
+    -------
+    np.ndarray
+        Array of frequencies in Hz.
+    """
+    return np.array([midi_to_freq(n) for n in midi_notes], dtype=np.float32)
+
+
+def freq_to_midi_array(freqs):
+    """Convert an array of frequencies to nearest MIDI notes.
+
+    Parameters
+    ----------
+    freqs : array-like
+        Sequence of frequencies in Hz.
+
+    Returns
+    -------
+    np.ndarray
+        Array of MIDI note numbers.
+    """
+    return np.array([freq_to_midi(f) for f in freqs], dtype=int)
