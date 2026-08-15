@@ -38,34 +38,29 @@ class AudioEngine:
         self._playing = False
         self._stream = None
         self._segment_queue = []
+        self._current_segment = None
+        self._segment_offset = 0
+        self._crossfade_buffer = None
+        self._crossfade_pos = 0
+        self._crossfade_active = False
 
     def start(self):
-        """Start playback in a background thread."""
+        """Start the audio stream in a background thread."""
         if self._playing:
             return
-        # Validate device availability before opening stream
-        if self.device is not None:
-            try:
-                sd.check_output_settings(device=self.device, samplerate=self.sample_rate, channels=1)
-            except Exception as e:
-                raise RuntimeError(f"Output device '{self.device}' is not available or does not support the requested settings: {e}")
-        else:
-            try:
-                sd.check_output_settings(samplerate=self.sample_rate, channels=1)
-            except Exception as e:
-                raise RuntimeError(f"Default output device is not available or does not support the requested settings: {e}")
         self._playing = True
         self._stream = sd.OutputStream(
             samplerate=self.sample_rate,
             blocksize=self.block_size,
             device=self.device,
             channels=1,
-            callback=self._audio_callback,
+            dtype='float32',
+            callback=self._callback,
         )
         self._stream.start()
 
     def stop(self):
-        """Stop playback and close the stream."""
+        """Stop the audio stream gracefully."""
         if not self._playing:
             return
         self._playing = False
@@ -75,47 +70,101 @@ class AudioEngine:
             self._stream = None
 
     def add_segment(self, segment):
-        """Add a new audio segment to be played.
+        """Add a new audio segment to be played after the current one.
+
+        If a segment is already queued, the new segment is appended. The engine
+        will crossfade from the current segment to the next one when the queue
+        is consumed.
 
         Parameters
         ----------
         segment : np.ndarray
-            Audio samples as a 1D float array.
+            1D float array of audio samples.
         """
         segment = np.asarray(segment, dtype=np.float32)
         if segment.ndim != 1:
-            raise ValueError("Audio segment must be 1D")
+            raise ValueError("Segment must be 1D")
         with self._lock:
             self._segment_queue.append(segment)
 
-    def _audio_callback(self, outdata, frames, time_info, status):
-        """Fill the output buffer with samples."""
+    def _callback(self, outdata, frames, time_info, status):
+        """Audio callback: fill output buffer with samples."""
         if status:
             print(f"Audio callback status: {status}")
+
+        outdata[:, 0] = 0.0
+
         with self._lock:
-            # Pull segments from queue into ring buffer if needed
-            while len(self._segment_queue) > 0 and self._space_available() >= self.block_size:
-                seg = self._segment_queue.pop(0)
-                self._write_segment(seg)
-            # Read from ring buffer
-            samples = np.zeros(frames, dtype=np.float32)
+            # Start crossfade if we have a new segment and not already crossfading
+            if not self._crossfade_active and self._segment_queue:
+                self._start_crossfade_locked()
+
+            # Write samples from the current segment or crossfade buffer
             for i in range(frames):
-                if self._read_pos == self._write_pos and not self._segment_queue:
-                    break  # no more data, output silence
-                samples[i] = self._buffer[self._read_pos]
-                self._read_pos = (self._read_pos + 1) % self._buffer_size
-            outdata[:, 0] = samples
+                if self._crossfade_active:
+                    # Crossfade mode: blend current segment and next segment
+                    if self._crossfade_pos < self.crossfade_samples:
+                        # Blending
+                        alpha = self._crossfade_pos / self.crossfade_samples
+                        current_sample = self._get_current_sample_locked()
+                        next_sample = self._get_next_sample_locked()
+                        outdata[i, 0] = (1.0 - alpha) * current_sample + alpha * next_sample
+                        self._crossfade_pos += 1
+                    else:
+                        # Crossfade done, switch to next segment
+                        self._finish_crossfade_locked()
+                        outdata[i, 0] = self._get_current_sample_locked()
+                else:
+                    # Normal playback
+                    outdata[i, 0] = self._get_current_sample_locked()
 
-    def _space_available(self):
-        """Return number of free slots in the ring buffer."""
-        return (self._write_pos - self._read_pos - 1) % self._buffer_size
+    def _start_crossfade_locked(self):
+        """Start crossfading from current segment to the next queued segment."""
+        if not self._segment_queue:
+            return
+        next_segment = self._segment_queue.pop(0)
+        self._crossfade_buffer = next_segment
+        self._crossfade_pos = 0
+        self._crossfade_active = True
 
-    def _write_segment(self, segment):
-        """Write a segment into the ring buffer with crossfade at the boundary."""
-        # Apply crossfade with the tail of the previous segment if possible
-        # For simplicity, we just write the segment directly; crossfade is handled elsewhere.
-        for sample in segment:
-            if self._space_available() == 0:
-                break  # buffer full, stop writing
-            self._buffer[self._write_pos] = sample
-            self._write_pos = (self._write_pos + 1) % self._buffer_size
+    def _finish_crossfade_locked(self):
+        """Finish crossfade: set current segment to the crossfade buffer."""
+        self._current_segment = self._crossfade_buffer
+        self._segment_offset = 0
+        self._crossfade_buffer = None
+        self._crossfade_pos = 0
+        self._crossfade_active = False
+
+    def _get_current_sample_locked(self):
+        """Get the next sample from the current segment, handling looping."""
+        if self._current_segment is None or len(self._current_segment) == 0:
+            return 0.0
+        sample = self._current_segment[self._segment_offset]
+        self._segment_offset += 1
+        if self._segment_offset >= len(self._current_segment):
+            # Loop back to start of the same segment if no queue
+            if not self._segment_queue:
+                self._segment_offset = 0
+            else:
+                # If there is a queue, we'll switch on next callback
+                self._segment_offset = 0
+        return float(sample)
+
+    def _get_next_sample_locked(self):
+        """Get the next sample from the crossfade buffer."""
+        if self._crossfade_buffer is None or len(self._crossfade_buffer) == 0:
+            return 0.0
+        pos = self._crossfade_pos
+        if pos >= len(self._crossfade_buffer):
+            return 0.0
+        return float(self._crossfade_buffer[pos])
+
+    def clear_queue(self):
+        """Clear any queued segments."""
+        with self._lock:
+            self._segment_queue.clear()
+
+    @property
+    def is_playing(self):
+        """Return True if the engine is currently playing."""
+        return self._playing
