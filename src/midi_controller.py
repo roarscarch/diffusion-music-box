@@ -1,64 +1,96 @@
 import numpy as np
 import threading
-from midi_clock import MidiClock
+import time
 
 
 class MidiController:
-    """Handles MIDI-like keyboard input for interactive control.
+    """A keyboard-based controller for interacting with the diffusion music box.
 
-    This class listens for keyboard events and translates them into
-    parameter changes for the diffusion music box. It provides a
-    simple event queue and a polling interface for the main loop.
+    This module provides a simple interface to map keyboard keys to parameter
+    changes in the generation pipeline. It listens for key presses and adjusts
+    parameters such as noise schedule, diffusion steps, and tempo. The controller
+    can run in a background thread and supports both interactive and headless
+    usage.
 
     Parameters
     ----------
-    clock : MidiClock
-        The clock instance used for timing and synchronization.
+    sample_rate : int, optional
+        Sample rate of the audio engine (unused but kept for interface consistency).
     """
 
-    def __init__(self, clock=None):
-        self.clock = clock or MidiClock()
-        self._event_queue = []
-        self._lock = threading.Lock()
+    def __init__(self, sample_rate=22050):
+        self.sample_rate = sample_rate
         self._running = False
-        self._key_map = {
-            'a': 'toggle_play',
-            's': 'stop',
-            'd': 'next_preset',
-            'f': 'prev_preset',
-            'j': 'tempo_down',
-            'k': 'tempo_up',
-            'l': 'toggle_crossfade',
-            ';': 'toggle_arp',
-            'q': 'quit',
-        }
+        self._thread = None
+        self._lock = threading.Lock()
+        self._callbacks = {}
+        self._recording = False
+        self._recorded_events = []
+
+    def register_callback(self, key, callback):
+        """Register a callback for a specific key.
+
+        Parameters
+        ----------
+        key : str
+            The key to listen for (e.g., 'a', 'left', 'space').
+        callback : callable
+            Function to call when the key is pressed. It receives a single
+            argument: the key name as a string.
+        """
+        with self._lock:
+            self._callbacks[key.lower()] = callback
 
     def start(self):
-        """Start listening for keyboard input."""
+        """Start the controller in a background thread.
+
+        This method spawns a thread that reads keyboard input. It requires a
+        terminal that supports raw input (e.g., on Linux/macOS with termios).
+        """
+        if self._running:
+            return
         self._running = True
-        self._thread = threading.Thread(target=self._listen, daemon=True)
+        self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self):
-        """Stop listening for keyboard input."""
+        """Stop the controller thread gracefully."""
         self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
 
-    def _listen(self):
-        """Internal loop reading characters from stdin."""
-        import sys
-        import tty
-        import termios
+    def _run(self):
+        """Main loop for reading keyboard input.
 
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+        Uses termios to set raw mode on Unix-like systems. Falls back to
+        reading from sys.stdin with a simple line-based input if raw mode
+        is not available (e.g., on Windows).
+        """
         try:
-            tty.setraw(fd)
+            import termios
+            import sys
+            import tty
+
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                while self._running:
+                    ch = sys.stdin.read(1)
+                    if ch:
+                        self._handle_key(ch)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except (ImportError, AttributeError):
+            # Fallback for Windows or non-terminal environments
+            import sys
             while self._running:
-                ch = sys.stdin.read(1)
-                if ch:
+                line = sys.stdin.readline().strip()
+                if not line:
+                    continue
+                for ch in line:
                     self._handle_key(ch)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     def _handle_key(self, key):
         """Process a single key press.
@@ -66,36 +98,34 @@ class MidiController:
         Parameters
         ----------
         key : str
-            The character read from stdin.
+            The key character or escape sequence name.
         """
-        action = self._key_map.get(key.lower())
-        if action:
-            with self._lock:
-                self._event_queue.append((action, self.clock.get_time()))
+        key = key.lower()
+        if key == '\x1b':
+            # Escape sequences for arrow keys are multi-byte; we ignore them here
+            return
+        with self._lock:
+            callback = self._callbacks.get(key)
+        if callback:
+            try:
+                callback(key)
+            except Exception as e:
+                print(f"Error in callback for key '{key}': {e}")
+        if self._recording:
+            self._recorded_events.append((time.time(), key))
 
-    def poll_events(self):
-        """Retrieve and clear pending events.
+    def start_recording(self):
+        """Start recording key press events."""
+        self._recording = True
+        self._recorded_events = []
+
+    def stop_recording(self):
+        """Stop recording and return the recorded events.
 
         Returns
         -------
         list of tuple
-            Each tuple is (action, timestamp).
+            List of (timestamp, key) tuples recorded since start_recording.
         """
-        with self._lock:
-            events = list(self._event_queue)
-            self._event_queue.clear()
-            return events
-
-    def get_state(self):
-        """Return current controller state for integration.
-
-        Returns
-        -------
-        dict
-            A snapshot of relevant state.
-        """
-        return {
-            'running': self._running,
-            'key_map': dict(self._key_map),
-            'clock_time': self.clock.get_time(),
-        }
+        self._recording = False
+        return self._recorded_events
