@@ -1,84 +1,84 @@
-class MIDIClock:
-    """Provides MIDI clock synchronization and tempo control.
+import time
+import threading
 
-    This class simulates a MIDI clock for external synchronization and
-    provides a simple way to track tempo and send clock pulses. It can be
-    used to synchronize the ambient music generation with external devices
-    or to maintain a steady internal tempo.
+
+class MidiClock:
+    """A simple MIDI clock for tempo-synced diffusion generation.
+
+    This module provides a reference clock that can be used to schedule
+    generation steps or note events in sync with a musical tempo. It
+    supports setting a BPM and provides methods to get the current beat
+    and time until the next beat.
 
     Parameters
     ----------
-    bpm : float
-        Beats per minute for the clock.
+    bpm : float, optional
+        Initial tempo in beats per minute.
     """
 
     def __init__(self, bpm=120.0):
         self.bpm = bpm
-        self._pulse_count = 0
-        self._running = False
-        self._tick_time = 0.0
+        self._start_time = time.monotonic()
+        self._lock = threading.Lock()
 
-    def start(self):
-        """Start the clock."""
-        self._running = True
-        self._pulse_count = 0
-
-    def stop(self):
-        """Stop the clock."""
-        self._running = False
+    @property
+    def beat_duration(self):
+        """Duration of one beat in seconds."""
+        return 60.0 / self.bpm
 
     def set_bpm(self, bpm):
-        """Set the tempo.
+        """Update the tempo.
 
         Parameters
         ----------
         bpm : float
-            New beats per minute value.
+            New tempo in beats per minute. Must be positive.
         """
         if bpm <= 0:
             raise ValueError("BPM must be positive")
-        self.bpm = bpm
+        with self._lock:
+            # Align current beat position to avoid jumps
+            current_beat = self.get_beat()
+            self.bpm = bpm
+            self._start_time = time.monotonic() - current_beat * self.beat_duration
 
-    def tick(self, sample_rate=1):
-        """Advance the clock by one tick (e.g., per audio block).
+    def get_beat(self):
+        """Current beat position (float) since clock start."""
+        with self._lock:
+            elapsed = time.monotonic() - self._start_time
+            return elapsed / self.beat_duration
+
+    def get_beat_count(self):
+        """Integer beat count (floor of current beat)."""
+        return int(self.get_beat())
+
+    def time_until_next_beat(self):
+        """Seconds until the next beat boundary."""
+        beat = self.get_beat()
+        frac = beat - int(beat)
+        return (1.0 - frac) * self.beat_duration
+
+    def reset(self):
+        """Reset the clock to beat zero."""
+        with self._lock:
+            self._start_time = time.monotonic()
+
+    def wait_for_beat(self, beat_count=None):
+        """Block until the next beat (or a specific beat count).
 
         Parameters
         ----------
-        sample_rate : int
-            Sample rate of audio, used to compute pulse interval in time.
+        beat_count : int, optional
+            If given, wait until this specific beat number. Otherwise wait
+            for the next beat boundary.
 
         Returns
         -------
-        bool
-            True if a clock pulse (24 pulses per quarter note) should be sent.
+        int
+            The beat count that was reached.
         """
-        if not self._running:
-            return False
-
-        # 24 pulses per quarter note (MIDI standard)
-        pulses_per_beat = 24
-        pulses_per_second = self.bpm * pulses_per_beat / 60.0
-        pulse_interval = 1.0 / pulses_per_second
-
-        # Increment time by one sample duration
-        self._tick_time += 1.0 / sample_rate
-
-        if self._tick_time >= pulse_interval:
-            self._tick_time -= pulse_interval
-            self._pulse_count += 1
-            return True
-        return False
-
-    def get_pulse_count(self):
-        """Return the total number of pulses sent since start."""
-        return self._pulse_count
-
-    def get_beat_count(self):
-        """Return the number of quarter notes since start."""
-        return self._pulse_count // 24
-
-    def reset(self):
-        """Reset the clock to initial state."""
-        self._pulse_count = 0
-        self._tick_time = 0.0
-        self._running = False
+        if beat_count is None:
+            beat_count = self.get_beat_count() + 1
+        while self.get_beat_count() < beat_count:
+            time.sleep(0.001)
+        return beat_count
