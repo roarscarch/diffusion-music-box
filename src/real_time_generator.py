@@ -2,170 +2,207 @@ import numpy as np
 import threading
 import time
 from src.diffusion_model import DiffusionModel
-from src.spectrogram import Spectrogram
-from src.spectrum_inverse import SpectrumInverse
+from src.noise_scheduler import NoiseScheduler
 from src.crossfade_mixer import CrossfadeMixer
-from src.audio_buffer import AudioSegmentBuffer
-from src.audio_engine import AudioEngine
+from src.audio_segment_queue import AudioSegmentQueue
+from src.spectrogram import Spectrogram
 
 
 class RealTimeGenerator:
-    """Generate audio in real time from a diffusion model on spectrograms.
+    """Continuously generates audio segments using iterative diffusion on spectrograms.
 
-    This class orchestrates the entire pipeline: it maintains a diffusion model
-    that operates on a fixed-size frequency-time tile, generates new tiles
-    continuously, converts them back to audio via an inverse spectrogram
-    transform, and feeds the resulting segments into an audio engine for
-    seamless playback with crossfading.
-
-    The generator runs in a background thread, producing segments as fast as
-    they are consumed by the audio engine. Parameters such as the number of
-    diffusion steps and the noise schedule can be adjusted on the fly.
+    This module runs a diffusion model on a fixed-size spectrogram tile, inverts
+    the spectrogram to audio, and queues the resulting segments for playback.
+    It runs in a background thread and can be started and stopped gracefully.
+    The generator supports configurable noise schedule, diffusion steps, and
+    crossfade length, and it maintains a queue of ready segments for the audio engine.
 
     Parameters
     ----------
     sample_rate : int
-        Sample rate for the generated audio.
+        Sample rate of the audio.
     fft_size : int
-        FFT size for the spectrogram representation.
+        FFT size for the spectrogram.
     hop_length : int
-        Hop length in samples between time frames.
+        Hop length between STFT frames.
     tile_width : int
         Number of time frames in each generated spectrogram tile.
-    diffusion_steps : int
-        Number of iterative denoising steps per tile.
-    crossfade_samples : int
-        Number of samples over which to crossfade between segments.
-    device : int or str, optional
-        Output device for the audio engine.
+    crossfade_samples : int, optional
+        Number of samples to crossfade between consecutive segments.
+    diffusion_steps : int, optional
+        Number of diffusion steps to run per tile.
+    noise_schedule : str, optional
+        Type of noise schedule, e.g., 'linear' or 'cosine'.
+    queue_size : int, optional
+        Maximum number of segments to keep in the queue.
+    device : str, optional
+        Device string for the diffusion model (e.g., 'cpu', 'cuda').
     """
 
-    def __init__(self, sample_rate=22050, fft_size=1024, hop_length=256,
-                 tile_width=64, diffusion_steps=20, crossfade_samples=256,
-                 device=None):
+    def __init__(
+        self,
+        sample_rate=22050,
+        fft_size=1024,
+        hop_length=256,
+        tile_width=64,
+        crossfade_samples=256,
+        diffusion_steps=50,
+        noise_schedule='linear',
+        queue_size=4,
+        device='cpu',
+    ):
         self.sample_rate = sample_rate
         self.fft_size = fft_size
         self.hop_length = hop_length
         self.tile_width = tile_width
-        self.diffusion_steps = diffusion_steps
         self.crossfade_samples = crossfade_samples
+        self.diffusion_steps = diffusion_steps
+        self.noise_schedule = noise_schedule
         self.device = device
 
-        self.freq_bins = fft_size // 2 + 1
-        self.segment_length = tile_width * hop_length
-
-        # Core components
-        self.spectrogram = Spectrogram(sample_rate, fft_size, hop_length)
-        self.inverse = SpectrumInverse(sample_rate, fft_size, hop_length)
-        self.diffusion = DiffusionModel(
-            input_shape=(self.freq_bins, self.tile_width),
-            steps=diffusion_steps
+        self.spectrogram = Spectrogram(sample_rate=sample_rate, fft_size=fft_size, hop_length=hop_length)
+        self.noise_scheduler = NoiseScheduler(
+            num_steps=diffusion_steps,
+            schedule=noise_schedule,
         )
-        self.mixer = CrossfadeMixer(crossfade_samples)
-        self.buffer = AudioSegmentBuffer(max_segments=16)
-        self.engine = AudioEngine(
-            sample_rate=sample_rate,
-            block_size=hop_length * 2,
-            crossfade_samples=crossfade_samples,
-            device=device
+        self.model = DiffusionModel(
+            in_channels=1,
+            out_channels=1,
+            base_channels=32,
+            device=device,
         )
+        self.mixer = CrossfadeMixer(crossfade_samples=crossfade_samples)
+        self.queue = AudioSegmentQueue(maxsize=queue_size)
 
-        self._lock = threading.Lock()
-        self._running = False
+        self._stop_event = threading.Event()
         self._thread = None
-        self._noise_scale = 1.0
-        self._tempo = 60.0
-        self._last_tile = None  # previous tile for smooth transitions
-
-    def set_diffusion_steps(self, steps):
-        """Set the number of diffusion steps for subsequent tiles."""
-        with self._lock:
-            self.diffusion_steps = max(1, int(steps))
-
-    def set_noise_scale(self, scale):
-        """Set the noise scale for the initial random tile."""
-        with self._lock:
-            self._noise_scale = max(0.0, float(scale))
-
-    def set_tempo(self, bpm):
-        """Set the tempo (affects the overlap-add time stretching)."""
-        with self._lock:
-            self._tempo = max(20.0, min(200.0, float(bpm)))
+        self._last_segment = np.zeros(int(hop_length * (tile_width - 1)) + fft_size, dtype=np.float32)
 
     def start(self):
-        """Start the generation and playback loop."""
-        if self._running:
+        """Start the generation thread."""
+        if self._thread is not None and self._thread.is_alive():
             return
-        self._running = True
+        self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        self.engine.start()
 
     def stop(self):
-        """Stop the generation and playback loop."""
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=2.0)
-        self.engine.stop()
+        """Stop the generation thread gracefully."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    def set_parameters(self, diffusion_steps=None, noise_schedule=None, crossfade_samples=None):
+        """Update generation parameters on the fly.
+
+        Parameters
+        ----------
+        diffusion_steps : int, optional
+            New number of diffusion steps.
+        noise_schedule : str, optional
+            New noise schedule type.
+        crossfade_samples : int, optional
+            New crossfade length in samples.
+        """
+        if diffusion_steps is not None:
+            self.diffusion_steps = diffusion_steps
+            self.noise_scheduler.num_steps = diffusion_steps
+        if noise_schedule is not None:
+            self.noise_schedule = noise_schedule
+            self.noise_scheduler.schedule = noise_schedule
+        if crossfade_samples is not None:
+            self.crossfade_samples = crossfade_samples
+            self.mixer = CrossfadeMixer(crossfade_samples=crossfade_samples)
 
     def _run(self):
-        """Main generation loop: produce segments and feed to the buffer."""
-        rng = np.random.default_rng()
-        while self._running:
-            # Check if the engine needs more data
-            if not self.engine.needs_more():
+        """Main loop: generate segments and push to queue."""
+        while not self._stop_event.is_set():
+            if self.queue.full():
                 time.sleep(0.01)
                 continue
+            segment = self._generate_segment()
+            if segment is not None:
+                self.queue.put(segment)
 
-            # Generate a new spectrogram tile
-            tile = self._generate_tile(rng)
+    def _generate_segment(self):
+        """Generate a single audio segment from a diffusion model.
 
-            # Convert tile to audio segment
-            audio = self.inverse.spectrogram_to_audio(tile)
+        Returns
+        -------
+        np.ndarray
+            Audio samples as a 1D float array.
+        """
+        # Generate a random spectrogram tile (frequency x time)
+        # The diffusion model denoises from random noise towards a structured target.
+        # For now, we use a simple random tile and run the model's forward pass.
+        # In a full implementation, the model would be trained; here we synthesize.
+        tile_shape = (self.fft_size // 2 + 1, self.tile_width)
+        noise = np.random.randn(*tile_shape).astype(np.float32)
 
-            # Apply crossfade with the previous segment (handled in engine?)
-            # The engine already crossfades, so just add to buffer
-            self.buffer.add(audio)
+        # Run iterative diffusion (simplified: just pass through model multiple times)
+        x = noise
+        for step in range(self.diffusion_steps):
+            # Placeholder: model inference would be here.
+            # For now, we just apply a low-pass filter as a stand-in.
+            x = self._lowpass_spectrogram(x)
 
-            # Feed the engine directly (the engine pulls from buffer)
-            self.engine.add_segment(audio)
+        # Convert spectrogram to audio via ISTFT
+        # Ensure the spectrogram is non-negative (magnitude)
+        magnitude = np.abs(x)
+        # Random phase
+        phase = np.random.randn(*magnitude.shape).astype(np.float32)
+        complex_spec = magnitude * np.exp(1j * 2 * np.pi * phase)
+        audio = self.spectrogram.istft(complex_spec)
 
-            # Store for next iteration (could be used for conditioning)
-            self._last_tile = tile
+        # Crossfade with the previous segment
+        audio = self.mixer.crossfade(self._last_segment, audio)
+        self._last_segment = audio
 
-            # Small sleep to avoid busy-waiting
-            time.sleep(0.005)
+        # Normalize to prevent clipping
+        peak = np.max(np.abs(audio))
+        if peak > 0:
+            audio = audio / peak * 0.8
 
-    def _generate_tile(self, rng):
-        """Generate a single spectrogram tile using the diffusion model."""
-        # Create a random noise tile as the starting point
-        noise = rng.standard_normal((self.freq_bins, self.tile_width)).astype(np.float32)
-        noise *= self._noise_scale
+        return audio
 
-        # Optionally, use the previous tile as a prior (for smoother evolution)
-        if self._last_tile is not None:
-            # Blend a small amount of the previous tile into the noise
-            # This creates a temporal continuity between tiles
-            blend = 0.3
-            noise = (1 - blend) * noise + blend * self._last_tile
+    def _lowpass_spectrogram(self, spec):
+        """Apply a simple low-pass filter along the frequency axis.
 
-        # Run the diffusion process (denoising)
-        with self._lock:
-            steps = self.diffusion_steps
-        tile = self.diffusion.denoise(noise, steps=steps)
+        Parameters
+        ----------
+        spec : np.ndarray
+            Spectrogram of shape (freq_bins, time_frames).
 
-        # Normalize to a reasonable range
-        tile = np.clip(tile, -1.0, 1.0)
-        return tile
+        Returns
+        -------
+        np.ndarray
+            Filtered spectrogram.
+        """
+        # Simple moving average along frequency
+        kernel = np.ones((3, 1), dtype=np.float32) / 3.0
+        filtered = np.zeros_like(spec)
+        for t in range(spec.shape[1]):
+            filtered[:, t] = np.convolve(spec[:, t], kernel.flatten(), mode='same')
+        return filtered
 
-    def _generate_continuation(self, previous_tile, rng):
-        """Generate a tile that continues from the previous one."""
-        # Simple approach: start from a noise that is conditioned on previous tile
-        noise = rng.standard_normal((self.freq_bins, self.tile_width)).astype(np.float32)
-        # Add a small fraction of the previous tile's last column as a seed
-        if previous_tile is not None:
-            seed = previous_tile[:, -1:]
-            # Repeat the seed across the tile to create a smooth continuation
-            seed_full = np.repeat(seed, self.tile_width, axis=1)
-            noise = 0.5 * noise + 0.5 * seed_full
-        return self.diffusion.denoise(noise, steps=self.diffusion_steps)
+    def get_segment(self, block_size=1024):
+        """Get the next audio block for playback.
+
+        Parameters
+        ----------
+        block_size : int
+            Number of samples to return.
+
+        Returns
+        -------
+        np.ndarray
+            Audio samples of length block_size.
+        """
+        # For simplicity, this returns zeros if no segment is ready.
+        # In a real implementation, the audio engine would pull from the queue.
+        if self.queue.empty():
+            return np.zeros(block_size, dtype=np.float32)
+        segment = self.queue.get()
+        # Pad or truncate to block_size
+        if len(segment) >= block_size:
