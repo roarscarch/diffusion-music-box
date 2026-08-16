@@ -1,84 +1,77 @@
-import time
 import threading
+import time
+import numpy as np
 
 
 class MidiClock:
-    """A simple MIDI clock for tempo-synced diffusion generation.
+    """A simple MIDI clock generator for tempo-synced diffusion generation.
 
-    This module provides a reference clock that can be used to schedule
-    generation steps or note events in sync with a musical tempo. It
-    supports setting a BPM and provides methods to get the current beat
-    and time until the next beat.
+    This class provides a beat-accurate clock that can be used to schedule
+    generation steps in sync with a musical tempo. It supports starting,
+    stopping, and querying the current beat position. The clock runs in a
+    background thread and can be used by the diffusion model to generate
+    segments at a steady tempo, enabling rhythmic and tempo-aligned ambient
+    textures.
 
     Parameters
     ----------
     bpm : float, optional
-        Initial tempo in beats per minute.
+        Beats per minute (default 120).
+    beats_per_bar : int, optional
+        Number of beats per bar (default 4).
     """
 
-    def __init__(self, bpm=120.0):
+    def __init__(self, bpm=120.0, beats_per_bar=4):
         self.bpm = bpm
-        self._start_time = time.monotonic()
+        self.beats_per_bar = beats_per_bar
+        self._running = False
+        self._thread = None
         self._lock = threading.Lock()
+        self._beat = 0.0
+        self._bar = 0
+        self._tick_count = 0
+        self._start_time = 0.0
+        self._last_tick_time = 0.0
+        self._listeners = []
 
-    @property
-    def beat_duration(self):
-        """Duration of one beat in seconds."""
-        return 60.0 / self.bpm
+    def start(self):
+        """Start the MIDI clock."""
+        if self._running:
+            return
+        self._running = True
+        self._start_time = time.time()
+        self._last_tick_time = self._start_time
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
-    def set_bpm(self, bpm):
-        """Update the tempo.
+    def stop(self):
+        """Stop the MIDI clock."""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
+            self._thread = None
 
-        Parameters
-        ----------
-        bpm : float
-            New tempo in beats per minute. Must be positive.
-        """
-        if bpm <= 0:
-            raise ValueError("BPM must be positive")
-        with self._lock:
-            # Align current beat position to avoid jumps
-            current_beat = self.get_beat()
-            self.bpm = bpm
-            self._start_time = time.monotonic() - current_beat * self.beat_duration
-
-    def get_beat(self):
-        """Current beat position (float) since clock start."""
-        with self._lock:
-            elapsed = time.monotonic() - self._start_time
-            return elapsed / self.beat_duration
-
-    def get_beat_count(self):
-        """Integer beat count (floor of current beat)."""
-        return int(self.get_beat())
-
-    def time_until_next_beat(self):
-        """Seconds until the next beat boundary."""
-        beat = self.get_beat()
-        frac = beat - int(beat)
-        return (1.0 - frac) * self.beat_duration
-
-    def reset(self):
-        """Reset the clock to beat zero."""
-        with self._lock:
-            self._start_time = time.monotonic()
-
-    def wait_for_beat(self, beat_count=None):
-        """Block until the next beat (or a specific beat count).
-
-        Parameters
-        ----------
-        beat_count : int, optional
-            If given, wait until this specific beat number. Otherwise wait
-            for the next beat boundary.
-
-        Returns
-        -------
-        int
-            The beat count that was reached.
-        """
-        if beat_count is None:
-            beat_count = self.get_beat_count() + 1
-        while self.get_beat_count() < beat_count:
+    def _run(self):
+        """Main loop that fires ticks at the current tempo."""
+        tick_interval = 60.0 / self.bpm / 24.0  # MIDI clock ticks per beat = 24
+        while self._running:
+            now = time.time()
+            elapsed = now - self._start_time
+            beat = elapsed * self.bpm / 60.0
+            with self._lock:
+                self._beat = beat
+                self._bar = int(beat // self.beats_per_bar)
+                self._tick_count = int(beat * 24.0)
+            # Notify listeners at each tick
+            if now - self._last_tick_time >= tick_interval:
+                self._last_tick_time = now
+                self._notify_tick()
             time.sleep(0.001)
-        return beat_count
+
+    def _notify_tick(self):
+        """Call all registered tick listeners."""
+        for listener in self._listeners:
+            try:
+                listener(self._beat, self._bar)
+            except Exception as e:
+                print(f"MIDI clock listener error: {e}
