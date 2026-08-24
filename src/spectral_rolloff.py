@@ -2,66 +2,78 @@ import numpy as np
 
 
 class SpectralRolloff:
-    """Compute the spectral rolloff of a spectrogram.
+    """Compute the spectral rolloff of an audio signal.
 
-    Spectral rolloff is the frequency below which a specified percentage
-    (typically 85%) of the total spectral energy is contained. It is a
-    measure of the brightness or sharpness of a sound and is commonly used
-    in audio analysis for timbre characterization.
+    The spectral rolloff is the frequency below which a specified percentage
+    (typically 85%) of the total spectral energy is contained. It is a useful
+    feature for distinguishing between different types of sounds, such as
+    voiced vs unvoiced speech, and can be used to characterize the brightness
+    of an audio signal.
 
-    This module provides a function to compute the rolloff frequency for
-    each time frame of a spectrogram, which can be used to analyze the
-    evolving spectral characteristics of generated ambient music.
+    Parameters
+    ----------
+    sample_rate : int
+        Sample rate of the audio signal in Hz.
+    percentile : float, optional
+        The percentage of total spectral energy below which the rolloff is
+        computed. Must be between 0 and 1. Default is 0.85.
     """
 
-    def __init__(self, sample_rate=22050, percentage=0.85):
-        """Initialize the spectral rolloff calculator.
-
-        Parameters
-        ----------
-        sample_rate : int
-            Sample rate of the audio signal in Hz.
-        percentage : float, optional
-            Percentage of total energy to consider (default 0.85).
-        """
-        if not 0.0 < percentage <= 1.0:
-            raise ValueError("Percentage must be in (0, 1]")
+    def __init__(self, sample_rate=22050, percentile=0.85):
         self.sample_rate = sample_rate
-        self.percentage = percentage
+        self.percentile = percentile
+        if not 0.0 < self.percentile < 1.0:
+            raise ValueError("Percentile must be between 0 and 1")
 
-    def compute(self, spectrogram):
-        """Compute the spectral rolloff for each frame.
+    def compute(self, audio, frame_size=1024, hop_length=256):
+        """Compute the spectral rolloff for each frame of an audio signal.
 
         Parameters
         ----------
-        spectrogram : np.ndarray
-            2D array of shape (freq_bins, time_frames) containing magnitude
-            spectrogram values (non-negative).
+        audio : np.ndarray
+            Input audio signal as a 1D float array.
+        frame_size : int, optional
+            Size of each analysis frame in samples. Default is 1024.
+        hop_length : int, optional
+            Number of samples between consecutive frames. Default is 256.
 
         Returns
         -------
         np.ndarray
-            1D array of length time_frames with the rolloff frequency in Hz
-            for each frame.
+            1D array of spectral rolloff frequencies (in Hz) for each frame.
         """
-        if spectrogram.ndim != 2:
-            raise ValueError("Spectrogram must be 2D")
-        if np.any(spectrogram < 0):
-            raise ValueError("Spectrogram values must be non-negative")
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim != 1:
+            raise ValueError("Audio must be 1D")
 
-        freq_bins, num_frames = spectrogram.shape
-        # Compute cumulative sum along frequency axis
-        cumsum = np.cumsum(spectrogram, axis=0)
-        total_energy = cumsum[-1, :]
-        # Avoid division by zero
-        total_energy = np.where(total_energy == 0, 1e-12, total_energy)
-        # Find the first bin where cumulative energy exceeds the threshold
-        threshold = self.percentage * total_energy
-        # Use argmax to find first True index (works because cumsum is monotonic)
-        # We need to handle the case where no bin exceeds threshold (shouldn't happen)
-        rolloff_bins = np.argmax(cumsum >= threshold, axis=0)
-        # Convert bin index to frequency
-        # Frequency resolution = sample_rate / (2 * (freq_bins - 1)) for one-sided spectrum
-        # But we don't know FFT size, so we approximate using linear mapping from 0 to Nyquist
-        nyquist = self.sample_rate / 2.0
-        return rolloff_bins * (nyquist / (freq_bins - 1))
+        # Zero-pad the audio so that we can take complete frames
+        num_frames = 1 + (len(audio) - frame_size) // hop_length
+        if num_frames <= 0:
+            return np.array([], dtype=np.float32)
+
+        rolloffs = np.zeros(num_frames, dtype=np.float32)
+        window = np.hanning(frame_size)
+        # Precompute frequency values for each bin
+        freqs = np.fft.rfftfreq(frame_size, d=1.0 / self.sample_rate)
+
+        for i in range(num_frames):
+            start = i * hop_length
+            frame = audio[start:start + frame_size] * window
+            spectrum = np.abs(np.fft.rfft(frame))
+            total_energy = np.sum(spectrum)
+            if total_energy == 0:
+                rolloffs[i] = 0.0
+                continue
+            cumulative = np.cumsum(spectrum)
+            # Find the index where cumulative energy reaches the threshold
+            threshold = self.percentile * total_energy
+            idx = np.searchsorted(cumulative, threshold)
+            # Ensure idx is within bounds
+            idx = min(idx, len(freqs) - 1)
+            rolloffs[i] = freqs[idx]
+
+        return rolloffs
+
+    def __call__(self, audio, frame_size=1024, hop_length=256):
+        """Callable interface for compute()."""
+        return self.compute(audio, frame_size, hop_length)
