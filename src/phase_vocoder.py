@@ -2,191 +2,152 @@ import numpy as np
 
 
 class PhaseVocoder:
-    """Phase vocoder for time-stretching and pitch-shifting audio segments.
+    """Phase vocoder for time-stretching and pitch-shifting audio.
 
-    This module provides a lightweight phase vocoder implementation that can
-    be used to alter the tempo and pitch of generated audio segments in
-    real-time. It is designed to work with the spectrogram-based diffusion
-    pipeline, allowing the user to adjust the perceived tempo and pitch of
-    the ambient output without regenerating the audio.
+    This module implements a classic phase vocoder algorithm that can
+    independently control the time scale and pitch of an audio signal.
+    It is useful in the diffusion music box for adjusting the tempo of
+    generated segments or for creating pitch-shifted variations.
 
-    The implementation uses the standard phase vocoder algorithm with a
-    windowed STFT, phase propagation, and overlap-add synthesis. It supports
-    both time-stretching (rate > 1 slows down, rate < 1 speeds up) and
-    pitch-shifting (by resampling after time-stretch).
+    The implementation uses an STFT-based approach: the input signal is
+    transformed into a time-frequency representation, the phases are
+    corrected to preserve horizontal coherence, and the frames are
+    resampled in time. Pitch shifting is achieved by resampling the
+    frequency axis.
 
     Parameters
     ----------
-    sample_rate : int
-        Sample rate of the audio.
     fft_size : int
-        FFT size for analysis/synthesis.
+        FFT size in samples.
     hop_size : int
-        Hop size for analysis.
+        Hop size in samples between analysis frames.
     """
 
-    def __init__(self, sample_rate=22050, fft_size=1024, hop_size=256):
-        self.sample_rate = sample_rate
+    def __init__(self, fft_size=1024, hop_size=256):
         self.fft_size = fft_size
         self.hop_size = hop_size
-        self.analysis_window = np.hanning(fft_size).astype(np.float32)
-        self.synthesis_window = np.hanning(fft_size).astype(np.float32)
-        # Normalize synthesis window to avoid amplitude modulation
-        self.synthesis_window = self.synthesis_window / np.sqrt(np.sum(self.synthesis_window**2))
+        self.window = np.hanning(fft_size).astype(np.float32)
 
-    def _stft(self, audio):
-        """Compute the short-time Fourier transform of the audio.
+    def stretch(self, audio, time_scale=1.0):
+        """Time-stretch the audio by a given factor.
 
         Parameters
         ----------
         audio : np.ndarray
-            1D float array of audio samples.
-
-        Returns
-        -------
-        tuple
-            (spectrogram, phases) where spectrogram is complex array of shape
-            (num_frames, num_bins) and phases is the unwrapped phase array.
-        """
-        num_frames = 1 + (len(audio) - self.fft_size) // self.hop_size
-        if num_frames <= 0:
-            num_frames = 1
-        spectrogram = np.zeros((num_frames, self.fft_size // 2 + 1), dtype=np.complex64)
-        phases = np.zeros((num_frames, self.fft_size // 2 + 1), dtype=np.float32)
-        for i in range(num_frames):
-            start = i * self.hop_size
-            frame = audio[start:start + self.fft_size]
-            if len(frame) < self.fft_size:
-                frame = np.pad(frame, (0, self.fft_size - len(frame)))
-            windowed = frame * self.analysis_window
-            spectrum = np.fft.rfft(windowed)
-            spectrogram[i] = spectrum
-            phases[i] = np.angle(spectrum)
-        return spectrogram, phases
-
-    def _istft(self, spectrogram, num_samples=None):
-        """Inverse STFT to reconstruct audio from a complex spectrogram.
-
-        Parameters
-        ----------
-        spectrogram : np.ndarray
-            Complex array of shape (num_frames, num_bins).
-        num_samples : int, optional
-            Desired output length. If None, computed from frames.
-
-        Returns
-        -------
-        np.ndarray
-            1D float array of reconstructed audio.
-        """
-        num_frames, num_bins = spectrogram.shape
-        if num_samples is None:
-            num_samples = (num_frames - 1) * self.hop_size + self.fft_size
-        output = np.zeros(num_samples, dtype=np.float32)
-        window_sum = np.zeros(num_samples, dtype=np.float32)
-        for i in range(num_frames):
-            start = i * self.hop_size
-            if start >= num_samples:
-                break
-            spectrum = spectrogram[i]
-            frame = np.fft.irfft(spectrum, n=self.fft_size)
-            frame = frame * self.synthesis_window
-            end = min(start + self.fft_size, num_samples)
-            length = end - start
-            output[start:end] += frame[:length]
-            window_sum[start:end] += self.synthesis_window[:length]
-        # Avoid division by zero
-        mask = window_sum > 1e-8
-        output[mask] /= window_sum[mask]
-        return output
-
-    def time_stretch(self, audio, rate):
-        """Time-stretch the audio by the given rate.
-
-        Parameters
-        ----------
-        audio : np.ndarray
-            1D float array of audio samples.
-        rate : float
+            Input audio as a 1D float array.
+        time_scale : float, optional
             Time-stretch factor. >1 slows down, <1 speeds up.
+            Must be positive.
 
         Returns
         -------
         np.ndarray
-            Time-stretched audio.
+            Time-stretched audio as a 1D float array.
         """
-        if rate <= 0:
-            raise ValueError("Rate must be positive")
-        if len(audio) < self.fft_size:
-            return audio.copy()
+        if time_scale <= 0:
+            raise ValueError("time_scale must be positive")
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim != 1:
+            raise ValueError("audio must be 1D")
 
-        spectrogram, _ = self._stft(audio)
-        num_frames, num_bins = spectrogram.shape
-        # Analysis hop size is fixed; synthesis hop is analysis_hop * rate
-        synth_hop = self.hop_size * rate
-        # Number of output frames for the same duration
-        out_frames = int(num_frames / rate)
-        if out_frames < 1:
-            out_frames = 1
+        # Analysis STFT
+        n_frames = max(1, (len(audio) - self.fft_size) // self.hop_size + 1)
+        frames = np.zeros((n_frames, self.fft_size), dtype=np.float32)
+        for i in range(n_frames):
+            start = i * self.hop_size
+            frames[i] = audio[start:start + self.fft_size] * self.window
+        spec = np.fft.rfft(frames, axis=1)
+        mag = np.abs(spec)
+        phase = np.angle(spec)
 
-        # Initialize phase accumulator
-        phase_acc = np.zeros(num_bins, dtype=np.float32)
-        # Angular frequency increments per bin (radians per hop)
-        freqs = np.fft.rfftfreq(self.fft_size, d=1.0/self.sample_rate)
-        omega = 2.0 * np.pi * freqs * self.hop_size / self.sample_rate
+        # Phase propagation for horizontal coherence
+        n_bins = spec.shape[1]
+        phase_advance = 2 * np.pi * np.arange(n_bins) * self.hop_size / self.fft_size
+        phase_acc = phase[0].copy()
+        phase_corrected = np.zeros_like(phase)
+        phase_corrected[0] = phase_acc
+        for i in range(1, n_frames):
+            delta = phase[i] - phase[i-1] - phase_advance
+            delta = np.mod(delta + np.pi, 2 * np.pi) - np.pi
+            phase_acc += phase_advance + delta
+            phase_corrected[i] = phase_acc
 
-        out_spec = np.zeros((out_frames, num_bins), dtype=np.complex64)
-        # Process each output frame using the nearest input frame
-        for i in range(out_frames):
-            # Source frame index (linear mapping)
-            src_idx = int(i * rate)
-            src_idx = min(src_idx, num_frames - 1)
+        # Resample frames in time
+        n_out_frames = int(round(n_frames / time_scale))
+        out_spec = np.zeros((n_out_frames, n_bins), dtype=np.complex64)
+        for i in range(n_out_frames):
+            src_idx = i * time_scale
+            idx0 = int(np.floor(src_idx))
+            idx1 = min(idx0 + 1, n_frames - 1)
+            frac = src_idx - idx0
+            interp_mag = mag[idx0] * (1 - frac) + mag[idx1] * frac
+            interp_phase = phase_corrected[idx0] * (1 - frac) + phase_corrected[idx1] * frac
+            out_spec[i] = interp_mag * np.exp(1j * interp_phase)
 
-            if src_idx == 0:
-                # First frame: copy magnitude, keep original phase
-                mag = np.abs(spectrogram[0])
-                phase = np.angle(spectrogram[0])
-            else:
-                # Compute phase difference between consecutive input frames
-                phase_prev = np.angle(spectrogram[src_idx - 1])
-                phase_curr = np.angle(spectrogram[src_idx])
-                delta_phi = phase_curr - phase_prev
-                # Wrap to [-pi, pi]
-                delta_phi = np.mod(delta_phi + np.pi, 2*np.pi) - np.pi
-                # Expected phase advance from the bin frequency
-                expected = omega
-                # Phase deviation from expected
-                deviation = delta_phi - expected
-                # Wrap deviation
-                deviation = np.mod(deviation + np.pi, 2*np.pi) - np.pi
-                # True frequency deviation (in radians per hop)
-                true_deviation = deviation / self.hop_size
-                # New phase increment for synthesis hop
-                phase_increment = omega + true_deviation * synth_hop
-                phase_acc += phase_increment
-                mag = np.abs(spectrogram[src_idx])
-                phase = phase_acc
+        # Inverse STFT with overlap-add
+        out_frames = np.fft.irfft(out_spec, n=self.fft_size, axis=1).astype(np.float32)
+        out_len = (n_out_frames - 1) * self.hop_size + self.fft_size
+        out_audio = np.zeros(out_len, dtype=np.float32)
+        for i in range(n_out_frames):
+            start = i * self.hop_size
+            out_audio[start:start + self.fft_size] += out_frames[i] * self.window
+        return out_audio
 
-            out_spec[i] = mag * np.exp(1j * phase)
+    def shift_pitch(self, audio, semitones=0.0):
+        """Pitch-shift the audio by a given number of semitones.
 
-        # Synthesize audio
-        output = self._istft(out_spec)
-        # Trim to match expected duration
-        expected_len = int(len(audio) * rate)
-        if len(output) > expected_len:
-            output = output[:expected_len]
-        elif len(output) < expected_len:
-            output = np.pad(output, (0, expected_len - len(output)))
-        return output
-
-    def pitch_shift(self, audio, semitones):
-        """Pitch-shift the audio by a number of semitones.
-
-        This is implemented by time-stretching the audio without changing
-        pitch, then resampling to restore the original duration, effectively
-        shifting the pitch.
+        This is achieved by resampling the frequency axis of the STFT
+        representation. A positive value raises the pitch, negative lowers.
 
         Parameters
         ----------
         audio : np.ndarray
-            1D float array
+            Input audio as a 1D float array.
+        semitones : float, optional
+            Pitch shift in semitones (can be fractional).
+
+        Returns
+        -------
+        np.ndarray
+            Pitch-shifted audio as a 1D float array.
+        """
+        if semitones == 0:
+            return np.asarray(audio, dtype=np.float32).copy()
+        ratio = 2.0 ** (semitones / 12.0)
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim != 1:
+            raise ValueError("audio must be 1D")
+
+        # STFT analysis
+        n_frames = max(1, (len(audio) - self.fft_size) // self.hop_size + 1)
+        frames = np.zeros((n_frames, self.fft_size), dtype=np.float32)
+        for i in range(n_frames):
+            start = i * self.hop_size
+            frames[i] = audio[start:start + self.fft_size] * self.window
+        spec = np.fft.rfft(frames, axis=1)
+        n_bins = spec.shape[1]
+
+        # Resample frequency bins
+        bin_freqs = np.arange(n_bins) * (self.fft_size / self.fft_size)  # normalized 0..0.5
+        # For each output bin, find source bin by dividing by ratio
+        out_bins = np.arange(n_bins)
+        src_bins = out_bins / ratio
+        src_bins = np.clip(src_bins, 0, n_bins - 1)
+        idx0 = np.floor(src_bins).astype(int)
+        idx1 = np.minimum(idx0 + 1, n_bins - 1)
+        frac = src_bins - idx0
+        # Interpolate magnitude and phase
+        mag = np.abs(spec)
+        phase = np.angle(spec)
+        new_mag = mag[:, idx0] * (1 - frac) + mag[:, idx1] * frac
+        new_phase = phase[:, idx0] * (1 - frac) + phase[:, idx1] * frac
+        new_spec = new_mag * np.exp(1j * new_phase)
+
+        # Inverse STFT
+        out_frames = np.fft.irfft(new_spec, n=self.fft_size, axis=1).astype(np.float32)
+        out_len = (n_frames - 1) * self.hop_size + self.fft_size
+        out_audio = np.zeros(out_len, dtype=np.float32)
+        for i in range(n_frames):
+            start = i * self.hop_size
+            out_audio[start:start + self.fft_size] += out_frames[i] * self.window
+        return out_audio
