@@ -2,103 +2,65 @@ import numpy as np
 
 
 class SpectralGate:
-    """Apply spectral gating to reduce noise in spectrogram tiles.
+    """Apply a noise gate to a spectrogram.
 
-    Spectral gating is a common technique for noise reduction: for each
-    frequency bin, we estimate a noise floor (e.g., from the lowest
-    percentile of magnitudes over time) and then attenuate bins that fall
-    below a threshold relative to that floor. This helps clean up the
-    diffusion output, removing faint artifacts and improving the perceived
-    audio quality.
+    This module suppresses low-amplitude frequency bins in a spectrogram,
+    reducing background noise and emphasizing tonal content. It can be used
+    as a preprocessing step before inverse transform to clean up generated
+    audio segments.
 
     Parameters
     ----------
-    threshold_db : float, optional
-        Gain reduction in decibels applied to bins below the noise floor.
-    floor_percentile : float, optional
-        Percentile (0-100) of magnitude per frequency bin used to estimate
-        the noise floor. Lower values give a more conservative estimate.
-    attack_coefficient : float, optional
-        Smoothing factor for the gate envelope (0-1). Higher values respond
-        faster but may cause pumping.
+    threshold : float
+        Relative amplitude threshold (0.0 to 1.0). Bins below this fraction
+        of the maximum amplitude are attenuated.
+    reduction_db : float
+        Amount of attenuation in decibels applied to gated bins.
     """
 
-    def __init__(self, threshold_db=-40.0, floor_percentile=10.0, attack_coefficient=0.1):
-        self.threshold_db = threshold_db
-        self.floor_percentile = floor_percentile
-        self.attack_coefficient = attack_coefficient
-
-    def _noise_floor(self, magnitude):
-        """Estimate noise floor per frequency bin.
-
-        Parameters
-        ----------
-        magnitude : np.ndarray
-            2D array of shape (freq_bins, time_steps) with magnitudes.
-
-        Returns
-        -------
-        np.ndarray
-            1D array of noise floor estimates per frequency bin.
-        """
-        # Use the specified percentile across time as the noise floor
-        return np.percentile(magnitude, self.floor_percentile, axis=1)
+    def __init__(self, threshold=0.1, reduction_db=20.0):
+        self.threshold = threshold
+        self.reduction_db = reduction_db
 
     def apply(self, spectrogram):
-        """Apply spectral gating to a spectrogram.
+        """Apply the noise gate to a spectrogram.
 
         Parameters
         ----------
         spectrogram : np.ndarray
-            2D complex or real array of shape (freq_bins, time_steps).
-            If complex, magnitude is used for gating and phase is preserved.
+            2D array of shape (freq_bins, time_frames) or 3D with batch dimension.
+            Magnitude spectrogram (non-negative).
 
         Returns
         -------
         np.ndarray
-            Gated spectrogram with same shape and dtype as input.
+            Gated spectrogram of the same shape.
         """
-        if spectrogram.ndim != 2:
-            raise ValueError("Spectrogram must be 2D")
-
-        # Work with magnitude and phase if complex
-        is_complex = np.iscomplexobj(spectrogram)
-        if is_complex:
-            magnitude = np.abs(spectrogram)
-            phase = np.angle(spectrogram)
+        spec = np.asarray(spectrogram, dtype=np.float32)
+        if spec.ndim == 2:
+            return self._apply_2d(spec)
+        elif spec.ndim == 3:
+            # Apply per batch element
+            return np.stack([self._apply_2d(s) for s in spec])
         else:
-            magnitude = spectrogram
+            raise ValueError("Spectrogram must be 2D or 3D")
 
-        # Estimate noise floor
-        floor = self._noise_floor(magnitude)
-        # Avoid division by zero
-        floor = np.maximum(floor, 1e-12)
+    def _apply_2d(self, spec):
+        """Apply gate to a single 2D spectrogram."""
+        max_val = np.max(spec) if spec.size > 0 else 0.0
+        if max_val <= 0:
+            return spec
 
-        # Compute gate gain in linear domain
-        threshold_linear = 10.0 ** (self.threshold_db / 20.0)
-        # For each bin, if magnitude is below floor * threshold, apply gain
-        # We'll compute a smooth gain using a soft knee
-        ratio = magnitude / floor[:, np.newaxis]
-        # Simple hard gate: gain = 1 if above threshold, else threshold_linear
-        gate = np.where(ratio > threshold_linear, 1.0, threshold_linear)
+        gate_threshold = max_val * self.threshold
+        reduction_factor = 10.0 ** (-self.reduction_db / 20.0)
 
-        # Apply attack smoothing across time to avoid clicks
-        smoothed = np.empty_like(gate)
-        smoothed[:, 0] = gate[:, 0]
-        alpha = self.attack_coefficient
-        for t in range(1, gate.shape[1]):
-            # Attack fast, release slow? Here we use same coefficient for simplicity
-            smoothed[:, t] = alpha * gate[:, t] + (1 - alpha) * smoothed[:, t - 1]
+        # Create a mask for bins below threshold
+        mask = spec < gate_threshold
 
-        # Apply gain
-        gated_magnitude = magnitude * smoothed
-
-        if is_complex:
-            # Reconstruct complex spectrogram
-            return gated_magnitude * np.exp(1j * phase)
-        else:
-            return gated_magnitude
+        # Apply reduction, keeping the original value if above threshold
+        gated = np.where(mask, spec * reduction_factor, spec)
+        return gated
 
     def __call__(self, spectrogram):
-        """Convenience method to apply the gate."""
+        """Alias for apply()."""
         return self.apply(spectrogram)
