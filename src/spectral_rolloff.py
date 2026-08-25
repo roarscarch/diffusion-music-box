@@ -1,64 +1,112 @@
 import numpy as np
 
 
-def spectral_rolloff(spectrogram, sample_rate=22050, threshold=0.85):
-    """Compute the spectral rolloff frequency for each time frame.
+class SpectralRolloff:
+    """Compute the spectral rolloff of an audio signal.
 
     The spectral rolloff is the frequency below which a specified percentage
-    (default 85%) of the total spectral energy is contained. It provides a
-    measure of the spectral shape and brightness of an audio signal.
+    (typically 85%) of the total spectral energy is contained. It provides a
+    measure of the spectral shape, indicating where the majority of energy
+    is concentrated. This can be useful for analyzing timbral brightness or
+    for controlling diffusion parameters based on spectral characteristics.
 
     Parameters
     ----------
-    spectrogram : np.ndarray
-        2D array of shape (freq_bins, time_frames) containing magnitude
-        spectrogram values (non-negative).
-    sample_rate : int, optional
-        Sample rate of the audio signal, used to convert bin indices to Hz.
+    sample_rate : int
+        Sample rate of the audio signal in Hz.
+    fft_size : int
+        FFT size to use for the spectrogram. Default is 1024.
+    hop_length : int
+        Hop length in samples between frames. Default is 512.
     threshold : float, optional
         Fraction of total energy below which the rolloff frequency is found.
-        Must be between 0 and 1.
-
-    Returns
-    -------
-    np.ndarray
-        1D array of length time_frames containing the rolloff frequency in Hz
-        for each frame.
-
-    Raises
-    ------
-    ValueError
-        If threshold is not between 0 and 1.
+        Must be between 0.0 and 1.0. Default is 0.85.
     """
-    if not 0.0 < threshold < 1.0:
-        raise ValueError(f"Threshold must be between 0 and 1, got {threshold}")
 
-    # Ensure non-negative values
-    spec = np.abs(spectrogram)
-    total_energy = np.sum(spec, axis=0)
-    cumulative = np.cumsum(spec, axis=0)
+    def __init__(self, sample_rate=22050, fft_size=1024, hop_length=512, threshold=0.85):
+        self.sample_rate = sample_rate
+        self.fft_size = fft_size
+        self.hop_length = hop_length
+        if not 0.0 < threshold <= 1.0:
+            raise ValueError("threshold must be in (0, 1]")
+        self.threshold = threshold
+        self._window = np.hanning(fft_size)
+        # Frequency bins for a one-sided spectrum
+        self._freqs = np.fft.rfftfreq(fft_size, d=1.0 / sample_rate)
 
-    # Find the smallest bin where cumulative energy exceeds threshold * total
-    # For frames with zero energy, rolloff is 0 Hz.
-    freq_bins = spec.shape[0]
-    rolloff_bin = np.zeros(spec.shape[1], dtype=int)
+    def _spectrogram(self, audio):
+        """Compute the magnitude spectrogram of an audio signal.
 
-    for i in range(spec.shape[1]):
-        if total_energy[i] == 0:
-            rolloff_bin[i] = 0
-        else:
-            # Find first index where cumulative >= threshold * total
-            rolloff_bin[i] = np.searchsorted(cumulative[:, i], threshold * total_energy[i])
+        Parameters
+        ----------
+        audio : np.ndarray
+            1D float array of audio samples.
 
-    # Convert bin index to frequency in Hz
-    # Frequency of bin k = k * sample_rate / (2 * (freq_bins - 1)) for one-sided spectrum
-    # More commonly, bin width = sample_rate / (2 * (freq_bins - 1)) for a one-sided FFT.
-    # For simplicity, assume uniform spacing from 0 to Nyquist.
-    if freq_bins > 1:
-        nyquist = sample_rate / 2.0
-        freqs = np.linspace(0.0, nyquist, freq_bins)
-    else:
-        freqs = np.array([0.0])
+        Returns
+        -------
+        np.ndarray
+            2D array of shape (n_frames, n_freq_bins) containing magnitude values.
+        """
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim != 1:
+            raise ValueError("audio must be 1D")
+        n_frames = 1 + (len(audio) - self.fft_size) // self.hop_length
+        if n_frames <= 0:
+            return np.zeros((0, len(self._freqs)), dtype=np.float32)
+        # Pad the audio to ensure at least one frame
+        pad_len = max(0, self.fft_size - len(audio))
+        if pad_len > 0:
+            audio = np.pad(audio, (0, pad_len))
+        frames = np.zeros((n_frames, self.fft_size), dtype=np.float32)
+        for i in range(n_frames):
+            start = i * self.hop_length
+            frames[i] = audio[start:start + self.fft_size] * self._window
+        mag = np.abs(np.fft.rfft(frames, axis=1))
+        return mag
 
-    rolloff_freqs = freqs[rolloff_bin]
-    return rolloff_freqs.astype(np.float32)
+    def compute(self, audio):
+        """Compute the spectral rolloff for each frame.
+
+        Parameters
+        ----------
+        audio : np.ndarray
+            1D float array of audio samples.
+
+        Returns
+        -------
+        np.ndarray
+            1D array of rolloff frequencies (in Hz) for each frame.
+        """
+        mag = self._spectrogram(audio)
+        if mag.shape[0] == 0:
+            return np.array([], dtype=np.float32)
+        # Compute cumulative sum of energy
+        cumsum = np.cumsum(mag ** 2, axis=1)
+        total_energy = cumsum[:, -1:]
+        # Avoid division by zero
+        total_energy = np.where(total_energy == 0, 1.0, total_energy)
+        # Find the first bin where cumulative energy exceeds threshold
+        rolloff_idx = np.argmax(cumsum >= self.threshold * total_energy, axis=1)
+        # If no bin exceeds (e.g., all zero), argmax returns 0; set to last bin
+        # Handle the case where the threshold is never reached (all zeros)
+        any_energy = np.any(mag > 0, axis=1)
+        rolloff_idx = np.where(any_energy, rolloff_idx, len(self._freqs) - 1)
+        return self._freqs[rolloff_idx]
+
+    def compute_mean(self, audio):
+        """Compute the mean spectral rolloff across all frames.
+
+        Parameters
+        ----------
+        audio : np.ndarray
+            1D float array of audio samples.
+
+        Returns
+        -------
+        float
+            Mean rolloff frequency in Hz, or 0.0 if no frames.
+        """
+        rolloffs = self.compute(audio)
+        if rolloffs.size == 0:
+            return 0.0
+        return float(np.mean(rolloffs))
