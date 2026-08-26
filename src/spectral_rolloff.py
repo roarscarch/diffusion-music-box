@@ -1,58 +1,66 @@
 import numpy as np
 
 
-def spectral_rolloff(spectrogram, sample_rate, rolloff_percent=0.85):
-    """Compute the spectral rolloff frequency for each frame of a spectrogram.
+class SpectralRolloff:
+    """Compute the spectral rolloff of a spectrogram.
 
     The spectral rolloff is the frequency below which a specified percentage
-    (e.g., 85%) of the total spectral energy is contained. It is a measure of
-    the spectral shape and can be used to characterize the brightness or
-    sharpness of an audio signal.
+    (typically 85%) of the total spectral energy is contained. It is a useful
+    feature for characterizing the brightness of a sound and can be used to
+    modulate the diffusion parameters in real time.
 
     Parameters
     ----------
-    spectrogram : np.ndarray
-        2D array of shape (n_freq_bins, n_frames) representing magnitude
-        spectrogram values.
     sample_rate : int
-        Sample rate of the audio signal in Hz.
+        Sample rate of the audio signal.
     rolloff_percent : float, optional
         Percentage of total energy below the rolloff frequency (0.0 to 1.0).
         Default is 0.85.
-
-    Returns
-    -------
-    np.ndarray
-        1D array of length n_frames with the rolloff frequency in Hz for each frame.
     """
-    if not 0.0 < rolloff_percent <= 1.0:
-        raise ValueError("rolloff_percent must be in (0, 1]")
 
-    # Compute cumulative sum along frequency axis
-    cumulative = np.cumsum(spectrogram, axis=0)
-    total_energy = cumulative[-1, :]
+    def __init__(self, sample_rate=22050, rolloff_percent=0.85):
+        self.sample_rate = sample_rate
+        self.rolloff_percent = rolloff_percent
 
-    # Avoid division by zero for silent frames
-    total_energy = np.maximum(total_energy, 1e-12)
+    def compute(self, spectrogram):
+        """Compute the spectral rolloff for each time frame.
 
-    # Normalize cumulative sum to get fraction of total energy
-    normalized = cumulative / total_energy[np.newaxis, :]
+        Parameters
+        ----------
+        spectrogram : np.ndarray
+            2D array of shape (freq_bins, time_frames) containing magnitude
+            spectrogram values (real, non-negative).
 
-    # Find the first frequency bin where normalized sum exceeds rolloff_percent
-    # For each frame, find the index of the first bin >= rolloff_percent
-    # Use argmax on a boolean mask (first True) - but careful: if no bin exceeds, argmax returns 0
-    # We'll handle by checking if any bin exceeds, else use last bin
-    exceeds = normalized >= rolloff_percent
-    rolloff_indices = np.argmax(exceeds, axis=0)
+        Returns
+        -------
+        np.ndarray
+            1D array of length time_frames with the rolloff frequency in Hz
+            for each frame.
+        """
+        spectrogram = np.asarray(spectrogram, dtype=np.float32)
+        if spectrogram.ndim != 2:
+            raise ValueError("Spectrogram must be 2D")
 
-    # If a frame has no bin exceeding, argmax returns 0, which is wrong. Fix by setting to last bin.
-    has_exceed = np.any(exceeds, axis=0)
-    rolloff_indices[~has_exceed] = spectrogram.shape[0] - 1
+        freq_bins, n_frames = spectrogram.shape
+        # Compute cumulative sum along frequency axis
+        cumulative = np.cumsum(spectrogram, axis=0)
+        total_energy = cumulative[-1, :]
 
-    # Convert bin index to frequency: bin i corresponds to frequency (i * sample_rate / (2 * (n_bins - 1)))
-    # Assuming spectrogram has n_bins = fft_size/2 + 1, so max frequency = sample_rate/2.
-    n_bins = spectrogram.shape[0]
-    freq_per_bin = sample_rate / (2.0 * (n_bins - 1))
-    rolloff_freqs = rolloff_indices * freq_per_bin
+        # Avoid division by zero for silent frames
+        total_energy = np.where(total_energy == 0, 1.0, total_energy)
+        normalized_cumulative = cumulative / total_energy
 
-    return rolloff_freqs
+        # Find the first bin where cumulative energy exceeds the threshold
+        # For each frame, get the index of the first bin >= rolloff_percent
+        # Use argmax on a boolean array (first True index)
+        threshold = self.rolloff_percent
+        rolloff_bins = np.argmax(normalized_cumulative >= threshold, axis=0)
+
+        # Convert bin index to frequency (Hz)
+        # Frequency of bin i is i * sample_rate / fft_size, but we don't have fft_size.
+        # Instead, we assume bin spacing is sample_rate / (2 * (freq_bins - 1)).
+        # This is a reasonable approximation for a one-sided spectrum.
+        bin_width = self.sample_rate / (2.0 * (freq_bins - 1))
+        rolloff_freq = rolloff_bins * bin_width
+
+        return rolloff_freq
