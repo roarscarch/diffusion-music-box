@@ -1,62 +1,98 @@
 import numpy as np
 
 
-def spectral_rolloff(spectrogram, sample_rate=22050, rolloff_percent=0.85):
-    """Compute the spectral rolloff frequency for each frame of a spectrogram.
+class SpectralRolloff:
+    """Compute the spectral rolloff point of a signal.
 
-    The spectral rolloff is the frequency below which a given percentage of the
-    total spectral energy is contained. It provides a measure of the spectral
-    shape and can be used to characterize timbre or brightness of the audio.
-
-    Parameters
-    ----------
-    spectrogram : np.ndarray
-        2D array of shape (freq_bins, time_frames) containing magnitude or
-        power values. Frequencies are assumed to be linearly spaced from 0 to
-        Nyquist.
-    sample_rate : int
-        Sample rate of the audio in Hz.
-    rolloff_percent : float, optional
-        Percentage (0.0 to 1.0) of total spectral energy to reach the rolloff
-        frequency. Default is 0.85.
-
-    Returns
-    -------
-    np.ndarray
-        1D array of length time_frames with the rolloff frequency in Hz for
-        each frame.
-
-    Raises
-    ------
-    ValueError
-        If rolloff_percent is not between 0 and 1.
+    The spectral rolloff is the frequency below which a specified percentage
+    (typically 85% or 95%) of the total spectral energy is contained. It is
+    a useful feature for characterizing the brightness of a sound and can be
+    used to analyze or modulate generated ambient textures.
     """
-    if not (0.0 < rolloff_percent < 1.0):
-        raise ValueError("rolloff_percent must be between 0 and 1")
 
-    n_freqs, n_frames = spectrogram.shape
-    if n_freqs == 0:
-        return np.zeros(n_frames)
+    def __init__(self, sample_rate=22050, fft_size=1024, hop_length=256, percentage=0.85):
+        """
+        Parameters
+        ----------
+        sample_rate : int
+            Sample rate of the audio signal.
+        fft_size : int
+            FFT size (number of frequency bins).
+        hop_length : int
+            Hop length between frames in samples.
+        percentage : float
+            Fraction of total energy below the rolloff point (0 < p < 1).
+        """
+        self.sample_rate = sample_rate
+        self.fft_size = fft_size
+        self.hop_length = hop_length
+        self.percentage = percentage
+        self.freq_bins = fft_size // 2 + 1
 
-    # Frequency axis (Hz) corresponding to each bin
-    freqs = np.linspace(0, sample_rate / 2, n_freqs)
+    def _stft(self, audio):
+        """Compute short-time Fourier transform magnitudes.
 
-    # Cumulative sum along frequency axis
-    total_energy = np.sum(spectrogram, axis=0)
+        Returns a 2D array of shape (freq_bins, n_frames).
+        """
+        # Pad signal to ensure enough frames
+        n_samples = len(audio)
+        n_frames = 1 + (n_samples - self.fft_size) // self.hop_length
+        if n_frames < 1:
+            n_frames = 1
+        # Pre-allocate spectrogram
+        spectrogram = np.zeros((self.freq_bins, n_frames), dtype=np.float32)
+        # Window function (Hann)
+        window = np.hanning(self.fft_size).astype(np.float32)
+        for i in range(n_frames):
+            start = i * self.hop_length
+            end = start + self.fft_size
+            frame = audio[start:end]
+            if len(frame) < self.fft_size:
+                frame = np.pad(frame, (0, self.fft_size - len(frame)))
+            spectrum = np.fft.rfft(frame * window, n=self.fft_size)
+            spectrogram[:, i] = np.abs(spectrum)
+        return spectrogram
 
-    # Avoid division by zero for silent frames
-    total_energy_safe = np.where(total_energy > 0, total_energy, 1.0)
-    cumsum = np.cumsum(spectrogram, axis=0) / total_energy_safe
+    def compute(self, audio):
+        """Compute spectral rolloff for each frame.
 
-    # Find the first bin where cumulative sum exceeds rolloff_percent
-    # For each frame, find the smallest index where cumsum >= rolloff_percent
-    # Use argmax on a boolean mask to get the first True
-    mask = cumsum >= rolloff_percent
-    rolloff_indices = np.argmax(mask, axis=0)
+        Parameters
+        ----------
+        audio : np.ndarray
+            1D float array of audio samples.
 
-    # For frames with zero energy, argmax returns 0, but we want 0 Hz
-    # Set to 0 Hz for silent frames
-    silent = total_energy <= 0
-    rolloff_indices[silent] = 0
+        Returns
+        -------
+        np.ndarray
+            1D array of rolloff frequencies (in Hz) for each frame.
+        """
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim != 1:
+            raise ValueError("Audio must be 1D")
+        spectrogram = self._stft(audio)
+        n_frames = spectrogram.shape[1]
+        rolloff_freqs = np.zeros(n_frames, dtype=np.float32)
+        for i in range(n_frames):
+            spectrum = spectrogram[:, i]
+            total_energy = np.sum(spectrum)
+            if total_energy <= 0:
+                rolloff_freqs[i] = 0.0
+                continue
+            cumsum = np.cumsum(spectrum)
+            # Find the first bin where cumulative energy exceeds threshold
+            threshold = self.percentage * total_energy
+            bin_idx = np.searchsorted(cumsum, threshold, side='left')
+            # Convert bin index to frequency
+            freq = bin_idx * self.sample_rate / self.fft_size
+            rolloff_freqs[i] = freq
+        return rolloff_freqs
 
-    return freqs[rolloff_indices]
+    def compute_average(self, audio):
+        """Compute the mean spectral rolloff across frames.
+
+        Useful as a single scalar feature for a segment.
+        """
+        rolloff = self.compute(audio)
+        if len(rolloff) == 0:
+            return 0.0
+        return float(np.mean(rolloff))
