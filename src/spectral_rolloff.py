@@ -1,65 +1,62 @@
 import numpy as np
 
 
-def spectral_rolloff(spectrogram, sample_rate, threshold=0.85):
-    """Compute the spectral rolloff point for each frame.
+def spectral_rolloff(spectrogram, sample_rate=22050, rolloff_percent=0.85):
+    """Compute the spectral rolloff frequency for each frame of a spectrogram.
 
-    The spectral rolloff is the frequency below which a given percentage
-    (threshold) of the total spectral energy is concentrated. It is a useful
-    feature for characterizing the brightness or timbre of a signal.
+    The spectral rolloff is the frequency below which a given percentage of the
+    total spectral energy is contained. It provides a measure of the spectral
+    shape and can be used to characterize timbre or brightness of the audio.
 
     Parameters
     ----------
     spectrogram : np.ndarray
-        Magnitude spectrogram of shape (n_frames, n_freq_bins) or
-        (n_freq_bins, n_frames). The function detects orientation based on
-        the typical FFT layout (freq bins as rows) but handles both.
+        2D array of shape (freq_bins, time_frames) containing magnitude or
+        power values. Frequencies are assumed to be linearly spaced from 0 to
+        Nyquist.
     sample_rate : int
-        Sample rate of the audio signal in Hz.
-    threshold : float, optional
-        Fraction of total energy (0 < threshold < 1) below which the rolloff
-        point is defined. Default is 0.85 (common value).
+        Sample rate of the audio in Hz.
+    rolloff_percent : float, optional
+        Percentage (0.0 to 1.0) of total spectral energy to reach the rolloff
+        frequency. Default is 0.85.
 
     Returns
     -------
     np.ndarray
-        Array of rolloff frequencies in Hz for each frame, shape (n_frames,).
+        1D array of length time_frames with the rolloff frequency in Hz for
+        each frame.
+
+    Raises
+    ------
+    ValueError
+        If rolloff_percent is not between 0 and 1.
     """
-    if threshold <= 0 or threshold >= 1:
-        raise ValueError("threshold must be between 0 and 1 exclusive")
+    if not (0.0 < rolloff_percent < 1.0):
+        raise ValueError("rolloff_percent must be between 0 and 1")
 
-    # Ensure spectrogram is 2D
-    if spectrogram.ndim != 2:
-        raise ValueError("spectrogram must be 2D")
-
-    # Detect orientation: assume frequency bins are the larger dimension
-    # and time frames are the smaller. This is a heuristic; for shape
-    # (n_freq, n_time) we transpose internally.
-    if spectrogram.shape[0] < spectrogram.shape[1]:
-        # Likely (n_frames, n_freq) -> transpose to (n_freq, n_frames)
-        spec = spectrogram.T
-    else:
-        spec = spectrogram
-
-    n_freq_bins, n_frames = spec.shape
-
-    # Frequency resolution
-    fft_size = (n_freq_bins - 1) * 2
-    freqs = np.fft.rfftfreq(fft_size, d=1.0 / sample_rate)
-    if len(freqs) != n_freq_bins:
-        # Fallback: linearly spaced bins (approximation)
-        freqs = np.linspace(0, sample_rate / 2, n_freq_bins)
-
-    # Compute cumulative energy
-    energy = np.sum(spec ** 2, axis=0)
-    total_energy = np.sum(energy)
-    if total_energy == 0:
+    n_freqs, n_frames = spectrogram.shape
+    if n_freqs == 0:
         return np.zeros(n_frames)
 
-    cumsum = np.cumsum(energy)
-    rolloff_idx = np.searchsorted(cumsum, threshold * total_energy)
+    # Frequency axis (Hz) corresponding to each bin
+    freqs = np.linspace(0, sample_rate / 2, n_freqs)
 
-    # Rolloff frequency at that index
-    rolloff_freq = freqs[rolloff_idx]
+    # Cumulative sum along frequency axis
+    total_energy = np.sum(spectrogram, axis=0)
 
-    return rolloff_freq
+    # Avoid division by zero for silent frames
+    total_energy_safe = np.where(total_energy > 0, total_energy, 1.0)
+    cumsum = np.cumsum(spectrogram, axis=0) / total_energy_safe
+
+    # Find the first bin where cumulative sum exceeds rolloff_percent
+    # For each frame, find the smallest index where cumsum >= rolloff_percent
+    # Use argmax on a boolean mask to get the first True
+    mask = cumsum >= rolloff_percent
+    rolloff_indices = np.argmax(mask, axis=0)
+
+    # For frames with zero energy, argmax returns 0, but we want 0 Hz
+    # Set to 0 Hz for silent frames
+    silent = total_energy <= 0
+    rolloff_indices[silent] = 0
+
+    return freqs[rolloff_indices]
