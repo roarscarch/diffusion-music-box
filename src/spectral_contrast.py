@@ -4,88 +4,97 @@ import numpy as np
 class SpectralContrast:
     """Compute spectral contrast features from a spectrogram.
 
-    Spectral contrast characterizes the difference between peaks and valleys
-    in each frequency sub-band. It is useful for analyzing the timbral
-    richness of the generated ambient music, helping to shape the diffusion
-    output toward desired spectral textures.
+    Spectral contrast measures the difference in amplitude between spectral
+    peaks and valleys in each sub-band. It is useful for analyzing timbral
+    texture in ambient music, where percussive or noisy elements can be
+    distinguished from sustained tones.
 
     Parameters
     ----------
     n_bands : int, optional
-        Number of sub-bands to divide the spectrum into.
-    fmin : float, optional
-        Minimum frequency in Hz for the lowest band.
-    fmax : float, optional
-        Maximum frequency in Hz for the highest band.
-    sample_rate : int, optional
-        Sample rate of the audio (used to map frequency bins).
-    fft_size : int, optional
-        FFT size used for the spectrogram (number of frequency bins).
+        Number of sub-bands to divide the spectrum into (default 6).
     """
 
-    def __init__(self, n_bands=6, fmin=50.0, fmax=8000.0, sample_rate=22050, fft_size=1024):
+    def __init__(self, n_bands=6):
         self.n_bands = n_bands
-        self.fmin = fmin
-        self.fmax = fmax
-        self.sample_rate = sample_rate
-        self.fft_size = fft_size
-        self.freq_bins = fft_size // 2 + 1
 
-        # Precompute band edges in Hz and bin indices
-        band_edges_hz = np.geomspace(fmin, fmax, n_bands + 1)
-        self.band_edges_bins = np.clip(
-            np.round(band_edges_hz * fft_size / sample_rate).astype(int),
-            0,
-            self.freq_bins - 1
-        )
+    def _split_bands(self, magnitude):
+        """Split the magnitude spectrum into sub-bands.
+
+        Parameters
+        ----------
+        magnitude : np.ndarray
+            1D array of magnitude values (e.g., one frame of a spectrogram).
+
+        Returns
+        -------
+        list of np.ndarray
+            List of sub-band magnitude arrays.
+        """
+        n_freq = len(magnitude)
+        # Divide the spectrum into equal-sized bands (or more naturally, octave bands)
+        # For simplicity, use linear division
+        band_edges = np.linspace(0, n_freq, self.n_bands + 1, dtype=int)
+        bands = []
+        for i in range(self.n_bands):
+            start = band_edges[i]
+            end = band_edges[i + 1]
+            if start < end:
+                bands.append(magnitude[start:end])
+            else:
+                bands.append(np.array([0.0]))
+        return bands
+
+    def _band_contrast(self, band):
+        """Compute contrast for a single band.
+
+        Parameters
+        ----------
+        band : np.ndarray
+            Magnitude values in the band.
+
+        Returns
+        -------
+        float
+            Contrast value (peak - valley) in the band.
+        """
+        if len(band) == 0:
+            return 0.0
+        peak = np.max(band)
+        valley = np.min(band)
+        return peak - valley
 
     def compute(self, spectrogram):
-        """Compute spectral contrast for each time frame.
+        """Compute spectral contrast for each frame of a spectrogram.
 
         Parameters
         ----------
         spectrogram : np.ndarray
-            2D array of shape (freq_bins, time_frames), magnitude or power.
+            2D array of shape (n_frames, n_freq_bins) containing magnitude
+            values (non-negative).
 
         Returns
         -------
         np.ndarray
-            2D array of shape (n_bands, time_frames) containing contrast values
-            (peak minus valley) for each band.
+            2D array of shape (n_frames, n_bands) with contrast values.
         """
+        spectrogram = np.asarray(spectrogram, dtype=np.float32)
         if spectrogram.ndim != 2:
             raise ValueError("Spectrogram must be 2D")
-        if spectrogram.shape[0] != self.freq_bins:
-            raise ValueError(
-                f"Expected {self.freq_bins} frequency bins, got {spectrogram.shape[0]}"
-            )
+        if np.any(spectrogram < 0):
+            raise ValueError("Spectrogram must contain non-negative magnitudes")
 
-        n_frames = spectrogram.shape[1]
-        contrast = np.zeros((self.n_bands, n_frames), dtype=np.float32)
+        n_frames, n_freq = spectrogram.shape
+        contrast = np.zeros((n_frames, self.n_bands), dtype=np.float32)
 
-        for band_idx in range(self.n_bands):
-            start = self.band_edges_bins[band_idx]
-            end = self.band_edges_bins[band_idx + 1]
-            if end <= start:
-                continue
-            band = spectrogram[start:end, :]
-            # Use log magnitude to reduce dynamic range
-            log_band = np.log(band + 1e-10)
-            peak = np.max(log_band, axis=0)
-            valley = np.min(log_band, axis=0)
-            contrast[band_idx, :] = peak - valley
+        for i in range(n_frames):
+            frame = spectrogram[i]
+            bands = self._split_bands(frame)
+            for j, band in enumerate(bands):
+                contrast[i, j] = self._band_contrast(band)
 
         return contrast
 
-    def compute_mean(self, spectrogram):
-        """Compute the mean spectral contrast over time.
-
-        Useful for summarizing the overall spectral texture of a segment.
-
-        Returns
-        -------
-        np.ndarray
-            1D array of length n_bands.
-        """
-        contrast = self.compute(spectrogram)
-        return np.mean(contrast, axis=1)
+    def __call__(self, spectrogram):
+        """Alias for compute() to allow callable usage."""
+        return self.compute(spectrogram)
