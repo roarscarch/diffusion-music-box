@@ -2,65 +2,88 @@ import numpy as np
 
 
 class SpectralRolloff:
-    """Compute spectral rolloff of a spectrogram.
+    """Compute the spectral rolloff frequency for a given magnitude spectrum.
 
-    Spectral rolloff is the frequency below which a specified percentage of
-    the total spectral energy is contained. It is a measure of the spectral
-    shape and can indicate brightness or timbral characteristics.
+    The spectral rolloff is the frequency below which a specified percentage
+    (typically 85%) of the total spectral energy is concentrated. It is a
+    useful feature for characterizing the brightness and timbral shape of an
+    audio signal.
     """
 
-    def __init__(self, threshold=0.85):
-        """Initialize the spectral rolloff calculator.
+    def __init__(self, sample_rate=22050, rolloff_percent=0.85):
+        """Initialize the spectral rolloff computer.
 
         Parameters
         ----------
-        threshold : float, optional
-            Fraction of total energy below the rolloff frequency (default 0.85).
-        """
-        if not 0 < threshold < 1:
-            raise ValueError("threshold must be between 0 and 1")
-        self.threshold = threshold
-
-    def compute(self, spectrogram, sample_rate, fft_size=None):
-        """Compute spectral rolloff for each time frame.
-
-        Parameters
-        ----------
-        spectrogram : np.ndarray
-            2D array of shape (freq_bins, time_frames) containing magnitude
-            or power values.
         sample_rate : int
-            Sample rate of the audio.
-        fft_size : int, optional
-            FFT size used to generate the spectrogram. If None, inferred
-            from the number of frequency bins.
+            Sample rate of the audio signal in Hz.
+        rolloff_percent : float
+            Percentage of total spectral energy below the rolloff frequency.
+            Must be between 0 and 1.
+        """
+        self.sample_rate = sample_rate
+        self.rolloff_percent = rolloff_percent
+
+    def compute(self, magnitude_spectrum):
+        """Compute the spectral rolloff frequency for a magnitude spectrum.
+
+        Parameters
+        ----------
+        magnitude_spectrum : np.ndarray
+            1D array of magnitude values (e.g., from FFT).
+
+        Returns
+        -------
+        float
+            The spectral rolloff frequency in Hz.
+
+        Raises
+        ------
+        ValueError
+            If the magnitude spectrum is empty or rolloff_percent is out of range.
+        """
+        if magnitude_spectrum.ndim != 1:
+            raise ValueError("Magnitude spectrum must be 1D")
+        if magnitude_spectrum.size == 0:
+            raise ValueError("Magnitude spectrum must not be empty")
+        if not 0 < self.rolloff_percent < 1:
+            raise ValueError("rolloff_percent must be between 0 and 1")
+
+        cumulative = np.cumsum(magnitude_spectrum)
+        total_energy = cumulative[-1]
+        if total_energy == 0:
+            return 0.0
+
+        threshold = self.rolloff_percent * total_energy
+        rolloff_index = np.searchsorted(cumulative, threshold)
+        # Convert index to frequency
+        fft_size = (magnitude_spectrum.size - 1) * 2
+        freq_bin_width = self.sample_rate / fft_size
+        return rolloff_index * freq_bin_width
+
+    def compute_spectrogram(self, magnitude_spectrogram):
+        """Compute spectral rolloff for each frame in a magnitude spectrogram.
+
+        Parameters
+        ----------
+        magnitude_spectrogram : np.ndarray
+            2D array of shape (n_frames, n_freq_bins) or (n_freq_bins, n_frames).
+            The frame axis is determined by the larger dimension.
 
         Returns
         -------
         np.ndarray
-            1D array of rolloff frequencies in Hz for each time frame.
+            1D array of rolloff frequencies for each frame.
         """
-        spec = np.asarray(spectrogram, dtype=np.float64)
-        if spec.ndim != 2:
-            raise ValueError("spectrogram must be 2D")
-        if fft_size is None:
-            fft_size = (spec.shape[0] - 1) * 2
-        freqs = np.fft.rfftfreq(fft_size, d=1.0 / sample_rate)
-        if len(freqs) != spec.shape[0]:
-            # Handle potential mismatch by trimming or padding
-            if len(freqs) > spec.shape[0]:
-                freqs = freqs[:spec.shape[0]]
-            else:
-                freqs = np.pad(freqs, (0, spec.shape[0] - len(freqs)), 'edge')
+        magnitude_spectrogram = np.asarray(magnitude_spectrogram)
+        if magnitude_spectrogram.ndim != 2:
+            raise ValueError("Magnitude spectrogram must be 2D")
 
-        cumulative = np.cumsum(spec, axis=0)
-        total_energy = cumulative[-1, :]
-        # Avoid division by zero
-        total_energy = np.where(total_energy <= 0, 1e-12, total_energy)
-        normalized = cumulative / total_energy
+        # Assume shape is (n_frames, n_freq_bins) if rows > cols, else transpose
+        if magnitude_spectrogram.shape[0] < magnitude_spectrogram.shape[1]:
+            magnitude_spectrogram = magnitude_spectrogram.T
 
-        # For each frame, find the first index where normalized >= threshold
-        rolloff_indices = np.argmax(normalized >= self.threshold, axis=0)
-        rolloff_freqs = freqs[rolloff_indices]
-
-        return rolloff_freqs
+        rolloffs = np.zeros(magnitude_spectrogram.shape[0], dtype=np.float32)
+        for i, frame in enumerate(magnitude_spectrogram):
+            rolloffs[i] = self.compute(frame)
+        return rolloffs
