@@ -2,133 +2,131 @@ import numpy as np
 
 
 class SpectralEnvelope:
-    """Extract and apply the spectral envelope of a signal.
+    """Extract the spectral envelope of a signal.
 
-    The spectral envelope describes the overall shape of the magnitude
-    spectrum, smoothing out fine-grained detail. It is useful for
-    normalizing spectral content, shaping timbre, or analyzing the
-    broad spectral characteristics of audio. This module provides methods
-    to compute the envelope from a magnitude spectrogram and to apply it
-    to a spectrogram for normalization or filtering.
+    The spectral envelope represents the overall shape of the spectrum,
+    smoothing out fine spectral detail. It is useful for analyzing timbral
+    characteristics and can be used to guide diffusion generation toward
+    desired spectral contours.
 
     Parameters
     ----------
-    fft_size : int
-        FFT size used to produce the spectrogram (number of frequency bins
-        is fft_size // 2 + 1).
-    smoothing : float, optional
-        Smoothing factor for the envelope (0.0 to 1.0). Higher values
-        produce a smoother envelope by averaging over more neighboring
-        frequency bins. Must be in the range [0, 1).
+    sample_rate : int
+        Sample rate of the audio signal.
+    n_fft : int, optional
+        FFT size. Default is 2048.
+    hop_length : int, optional
+        Hop length between frames. Default is n_fft // 4.
     """
 
-    def __init__(self, fft_size=1024, smoothing=0.5):
-        if fft_size < 2:
-            raise ValueError("fft_size must be at least 2")
-        if not 0.0 <= smoothing < 1.0:
-            raise ValueError("smoothing must be in range [0, 1)")
-        self.fft_size = fft_size
-        self.freq_bins = fft_size // 2 + 1
-        self.smoothing = smoothing
+    def __init__(self, sample_rate=22050, n_fft=2048, hop_length=None):
+        self.sample_rate = sample_rate
+        self.n_fft = n_fft
+        self.hop_length = hop_length if hop_length is not None else n_fft // 4
+        self.freq_bins = n_fft // 2 + 1
 
-    def compute_envelope(self, spectrogram):
-        """Compute the spectral envelope of a magnitude spectrogram.
+    def _stft_magnitude(self, audio):
+        """Compute the magnitude spectrogram using a simple STFT.
 
         Parameters
         ----------
-        spectrogram : np.ndarray
-            2D array of shape (freq_bins, time_frames) containing
-            non-negative magnitude values.
+        audio : np.ndarray
+            1D float array of audio samples.
 
         Returns
         -------
         np.ndarray
-            2D array of the same shape as the input, containing the
-            smoothed envelope. Each column is smoothed across frequency.
-
-        Raises
-        ------
-        ValueError
-            If the spectrogram does not have the expected number of
-            frequency bins or contains negative values.
+            2D float array of shape (freq_bins, n_frames) with magnitude values.
         """
-        spectrogram = np.asarray(spectrogram, dtype=np.float32)
-        if spectrogram.ndim != 2:
-            raise ValueError("spectrogram must be 2D")
-        if spectrogram.shape[0] != self.freq_bins:
-            raise ValueError(
-                f"Expected {self.freq_bins} frequency bins, got {spectrogram.shape[0]}"
-            )
-        if np.any(spectrogram < 0):
-            raise ValueError("spectrogram must contain non-negative values")
+        if audio.ndim != 1:
+            raise ValueError("Audio must be 1D")
+        n_frames = 1 + (len(audio) - self.n_fft) // self.hop_length
+        if n_frames <= 0:
+            raise ValueError("Audio too short for given FFT size and hop length")
+        window = np.hanning(self.n_fft)
+        frames = np.zeros((self.freq_bins, n_frames), dtype=np.float32)
+        for i in range(n_frames):
+            start = i * self.hop_length
+            segment = audio[start:start + self.n_fft] * window
+            spectrum = np.fft.rfft(segment, n=self.n_fft)
+            frames[:, i] = np.abs(spectrum)
+        return frames
 
-        # Smooth across frequency using a simple moving average
-        kernel_size = max(1, int(self.smoothing * self.freq_bins))
-        if kernel_size == 1:
-            return spectrogram.copy()
+    def _smoothed_spectrum(self, magnitude, smoothing_bins=5):
+        """Apply a simple moving average smoothing across frequency bins.
 
-        # Pad the spectrum symmetrically to handle edges
-        pad = kernel_size // 2
-        padded = np.pad(spectrogram, ((pad, pad), (0, 0)), mode='edge')
-        envelope = np.zeros_like(spectrogram, dtype=np.float32)
+        Parameters
+        ----------
+        magnitude : np.ndarray
+            2D magnitude spectrogram (freq_bins, n_frames).
+        smoothing_bins : int, optional
+            Number of bins to average over (must be odd). Default is 5.
 
-        for i in range(self.freq_bins):
-            envelope[i] = np.mean(padded[i:i + kernel_size], axis=0)
+        Returns
+        -------
+        np.ndarray
+            Smoothed magnitude spectrogram.
+        """
+        if smoothing_bins % 2 == 0:
+            raise ValueError("smoothing_bins must be odd")
+        pad = smoothing_bins // 2
+        # Pad along frequency axis
+        padded = np.pad(magnitude, ((pad, pad), (0, 0)), mode='edge')
+        # Simple moving average using cumulative sum for efficiency
+        cumsum = np.cumsum(padded, axis=0)
+        smoothed = np.zeros_like(magnitude, dtype=np.float32)
+        for i in range(magnitude.shape[0]):
+            start = i
+            end = i + smoothing_bins
+            # Since cumsum is over padded array, shift by pad
+            total = cumsum[end] - cumsum[start]
+            smoothed[i] = total / smoothing_bins
+        return smoothed
 
+    def extract(self, audio, smoothing_bins=5, normalize=True):
+        """Extract the spectral envelope as a 2D array.
+
+        Parameters
+        ----------
+        audio : np.ndarray
+            1D float array of audio samples.
+        smoothing_bins : int, optional
+            Number of frequency bins to smooth over. Default is 5.
+        normalize : bool, optional
+            If True, normalize the envelope to [0, 1] per frame. Default is True.
+
+        Returns
+        -------
+        np.ndarray
+            2D float array of shape (freq_bins, n_frames) representing the
+            spectral envelope magnitude.
+        """
+        magnitude = self._stft_magnitude(audio)
+        envelope = self._smoothed_spectrum(magnitude, smoothing_bins)
+        if normalize:
+            # Normalize each frame to max 1.0
+            max_vals = np.max(envelope, axis=0, keepdims=True)
+            max_vals[max_vals == 0] = 1.0  # avoid division by zero
+            envelope = envelope / max_vals
         return envelope
 
-    def apply_envelope(self, spectrogram, envelope=None, normalize=True):
-        """Apply a spectral envelope to a magnitude spectrogram.
-
-        If an envelope is not provided, it is computed from the input
-        spectrogram. The envelope is then applied by dividing the input
-        by the envelope (if normalize is True) or by multiplying the
-        envelope by the input (if normalize is False). This can be used
-        to flatten the spectrum (normalize) or to shape the spectrum.
+    def extract_frame(self, spectrum, smoothing_bins=5):
+        """Extract the spectral envelope from a single magnitude spectrum.
 
         Parameters
         ----------
-        spectrogram : np.ndarray
-            2D array of shape (freq_bins, time_frames).
-        envelope : np.ndarray, optional
-            Precomputed envelope of the same shape. If None, computed
-            from the input.
-        normalize : bool, optional
-            If True, divide the spectrogram by the envelope to flatten
-            the spectrum. If False, multiply the envelope by the
-            spectrogram to shape it.
+        spectrum : np.ndarray
+            1D float array of magnitude spectrum (freq_bins,).
+        smoothing_bins : int, optional
+            Number of frequency bins to smooth over. Default is 5.
 
         Returns
         -------
         np.ndarray
-            Processed spectrogram.
-
-        Raises
-        ------
-        ValueError
-            If the envelope shape does not match the spectrogram.
+            1D float array representing the spectral envelope.
         """
-        spectrogram = np.asarray(spectrogram, dtype=np.float32)
-        if spectrogram.ndim != 2:
-            raise ValueError("spectrogram must be 2D")
-
-        if envelope is None:
-            envelope = self.compute_envelope(spectrogram)
-        else:
-            envelope = np.asarray(envelope, dtype=np.float32)
-            if envelope.shape != spectrogram.shape:
-                raise ValueError("envelope shape must match spectrogram shape")
-
-        # Avoid division by zero
-        safe_envelope = np.maximum(envelope, 1e-8)
-
-        if normalize:
-            return spectrogram / safe_envelope
-        else:
-            return spectrogram * envelope
-
-    def __repr__(self):
-        return (
-            f"SpectralEnvelope(fft_size={self.fft_size}, "
-            f"smoothing={self.smoothing})"
-        )
+        if spectrum.ndim != 1:
+            raise ValueError("Spectrum must be 1D")
+        magnitude = spectrum.reshape(-1, 1)
+        envelope = self._smoothed_spectrum(magnitude, smoothing_bins)
+        return envelope.flatten()
