@@ -1,63 +1,72 @@
 import numpy as np
 
 
-def spectral_rolloff(spectrogram, sample_rate, percentile=0.85):
-    """Compute the spectral rolloff frequency for each frame.
+class SpectralRolloff:
+    """Compute spectral rolloff frequency for each frame of a spectrogram.
 
-    The spectral rolloff is the frequency below which a given percentage
-    (default 85%) of the total spectral energy is contained. It is a
-    measure of the spectral shape and can be used to distinguish between
-    bright and dark timbres.
+    The spectral rolloff is the frequency below which a specified percentage
+    of the total spectral energy is concentrated. It is a useful measure of
+    the spectral shape and brightness of an audio signal. This module provides
+    a function to compute the rolloff frequency for each time frame of a
+    magnitude spectrogram or a power spectrogram.
 
     Parameters
     ----------
-    spectrogram : np.ndarray
-        2D array of shape (n_frames, n_freq_bins) or (n_freq_bins, n_frames).
-        The spectrogram magnitude values. If shape is (n_freq_bins, n_frames),
-        it will be transposed internally.
     sample_rate : int
         Sample rate of the audio signal in Hz.
-    percentile : float, optional
-        The percentile (0.0 to 1.0) of energy to use as the rolloff threshold.
-        Default is 0.85.
-
-    Returns
-    -------
-    np.ndarray
-        1D array of length n_frames with the rolloff frequency in Hz for each frame.
-
-    Raises
-    ------
-    ValueError
-        If spectrogram is not 2D or percentile is not in (0, 1).
+    rolloff_percent : float, optional
+        Percentage of total spectral energy to consider (between 0 and 1).
+        Default is 0.85 (85%).
     """
-    spectrogram = np.asarray(spectrogram, dtype=np.float32)
-    if spectrogram.ndim != 2:
-        raise ValueError("Spectrogram must be 2D")
-    if not 0.0 < percentile < 1.0:
-        raise ValueError("Percentile must be between 0 and 1")
 
-    # Assume frames are rows; if not, transpose
-    if spectrogram.shape[0] > spectrogram.shape[1]:
-        spectrogram = spectrogram.T
+    def __init__(self, sample_rate=22050, rolloff_percent=0.85):
+        if not 0.0 < rolloff_percent <= 1.0:
+            raise ValueError("rolloff_percent must be in (0, 1]")
+        self.sample_rate = sample_rate
+        self.rolloff_percent = rolloff_percent
 
-    n_frames, n_freq_bins = spectrogram.shape
+    def compute(self, spectrogram):
+        """Compute the spectral rolloff frequency for each frame.
 
-    # Compute cumulative energy along frequency axis
-    energy = np.sum(spectrogram, axis=1)
-    cumulative = np.cumsum(spectrogram, axis=1)
+        Parameters
+        ----------
+        spectrogram : np.ndarray
+            2D array of shape (freq_bins, time_frames) representing the
+            magnitude or power spectrogram. Frequencies are assumed to be
+            linearly spaced from 0 to Nyquist.
 
-    # Find the first bin where cumulative energy exceeds the threshold
-    threshold = energy[:, np.newaxis] * percentile
-    rolloff_bin = np.argmax(cumulative >= threshold, axis=1)
+        Returns
+        -------
+        np.ndarray
+            1D array of length time_frames containing the rolloff frequency
+            in Hz for each frame.
+        """
+        spectrogram = np.asarray(spectrogram, dtype=np.float32)
+        if spectrogram.ndim != 2:
+            raise ValueError("spectrogram must be 2D")
+        if spectrogram.shape[0] < 2:
+            raise ValueError("spectrogram must have at least 2 frequency bins")
 
-    # If no bin exceeds threshold (e.g., all zero), set to max bin
-    # argmax returns 0 for all-zero rows, so handle that case
-    all_zero = energy == 0
-    rolloff_bin[all_zero] = n_freq_bins - 1
+        freq_bins, time_frames = spectrogram.shape
+        # Compute cumulative sum along frequency axis
+        cumulative = np.cumsum(spectrogram, axis=0)
+        total_energy = cumulative[-1, :]
+        # Avoid division by zero; frames with zero energy get rolloff 0
+        total_energy[total_energy == 0] = 1.0
 
-    # Convert bin index to frequency
-    freq_per_bin = sample_rate / (2 * (n_freq_bins - 1)) if n_freq_bins > 1 else 0
-    rolloff_freq = rolloff_bin * freq_per_bin
+        # Find the first bin where cumulative energy exceeds the threshold
+        threshold = self.rolloff_percent * total_energy
+        # For each frame, find the index where cumulative >= threshold
+        # Use argmax on a boolean mask: first True index
+        rolloff_bins = np.argmax(cumulative >= threshold, axis=0)
 
-    return rolloff_freq
+        # Convert bin index to frequency (Hz)
+        # Frequency of bin i is i * sample_rate / (2 * (freq_bins - 1)) for
+        # FFT with N bins (0 to Nyquist). But for simplicity, use linear mapping.
+        max_freq = self.sample_rate / 2.0
+        rolloff_freqs = rolloff_bins * max_freq / (freq_bins - 1)
+        return rolloff_freqs
+
+    def __call__(self, spectrogram):
+        """Convenience call method."""
+        return self.compute(spectrogram)
